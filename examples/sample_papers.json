@@ -1,0 +1,161 @@
+{
+  "target": {
+    "top_k": 3
+  },
+  "mode": "content_only",
+  "config": {
+    "posterior_samples": 500,
+    "seed": 17
+  },
+  "papers": [
+    {
+      "paper_id": "p1",
+      "title": "Efficient Long-Horizon Robot Planning with Verified Skill Graphs",
+      "abstract": "A robotics planning paper with verification-oriented experiments.",
+      "pointwise": {
+        "pointwise_good_probability": 0.91,
+        "uncertainty": 0.16,
+        "rubric_scores": {
+          "novelty": 4.6,
+          "evidence": 4.2
+        },
+        "summary": "Strong planning contribution with clear evaluation.",
+        "reasons": [
+          "high-quality experiments",
+          "good fit to embodied AI topics"
+        ]
+      },
+      "metadata": {
+        "topic": "robotics",
+        "venue": "ICRA"
+      }
+    },
+    {
+      "paper_id": "p2",
+      "title": "Uncertainty-Calibrated Agent Evaluation for Tool-Using Models",
+      "abstract": "Agent benchmark paper that reports calibration and ablations.",
+      "pointwise": {
+        "pointwise_good_probability": 0.86,
+        "uncertainty": 0.28,
+        "rubric_scores": {
+          "novelty": 4.1,
+          "evidence": 4.0
+        },
+        "summary": "Useful evaluation setup with calibration focus.",
+        "reasons": [
+          "directly relevant to agent evaluation",
+          "reports uncertainty behavior"
+        ]
+      },
+      "metadata": {
+        "topic": "agents",
+        "venue": "NeurIPS"
+      }
+    },
+    {
+      "paper_id": "p3",
+      "title": "Fast Dataset Deduplication with Streaming Fingerprints",
+      "abstract": "Data engineering paper with a practical streaming dedupe design.",
+      "pointwise": {
+        "pointwise_good_probability": 0.73,
+        "uncertainty": 0.34,
+        "rubric_scores": {
+          "novelty": 3.5,
+          "evidence": 4.3
+        },
+        "summary": "Solid engineering result but less central to the target.",
+        "reasons": [
+          "strong systems evidence"
+        ]
+      },
+      "metadata": {
+        "topic": "data",
+        "venue": "VLDB"
+      }
+    },
+    {
+      "paper_id": "p4",
+      "title": "Benchmark Leakage in Retrieval-Augmented Research Assistants",
+      "abstract": "A study of leakage risks in RAG-based research workflows.",
+      "pointwise": {
+        "pointwise_good_probability": 0.68,
+        "uncertainty": 0.62,
+        "rubric_scores": {
+          "novelty": 3.8,
+          "evidence": 3.4
+        },
+        "summary": "Potentially important but uncertain evidence quality.",
+        "reasons": [
+          "security-relevant RAG finding",
+          "needs closer reading"
+        ]
+      },
+      "metadata": {
+        "topic": "rag",
+        "venue": "ACL"
+      }
+    },
+    {
+      "paper_id": "p5",
+      "title": "A Survey of Prompt Templates for Summarization",
+      "abstract": "A broad survey with limited new empirical evidence.",
+      "pointwise": {
+        "pointwise_good_probability": 0.42,
+        "uncertainty": 0.25,
+        "rubric_scores": {
+          "novelty": 2.1,
+          "evidence": 2.7
+        },
+        "summary": "Useful background, unlikely to be a top pick.",
+        "reasons": [
+          "limited original contribution"
+        ]
+      },
+      "metadata": {
+        "topic": "nlp",
+        "venue": "arXiv"
+      }
+    },
+    {
+      "paper_id": "p6",
+      "title": "Low-Cost Preference Modeling for Paper Recommendation",
+      "abstract": "Preference modeling paper with cheap pairwise comparison recipes.",
+      "pointwise": {
+        "pointwise_good_probability": 0.66,
+        "uncertainty": 0.55,
+        "rubric_scores": {
+          "novelty": 3.7,
+          "evidence": 3.6
+        },
+        "summary": "Close to Sestina mechanics and worth auditing.",
+        "reasons": [
+          "methodologically aligned",
+          "uncertain external validity"
+        ]
+      },
+      "metadata": {
+        "topic": "ranking",
+        "venue": "SIGIR"
+      }
+    }
+  ],
+  "comparisons": [
+    {
+      "left_id": "p4",
+      "right_id": "p3",
+      "winner": "tie",
+      "soft_probability": 0.5,
+      "confidence": 0.5,
+      "reasons": [
+        "judge found different strengths"
+      ],
+      "order": {
+        "shown_first_id": "p4",
+        "shown_second_id": "p3",
+        "randomized": true,
+        "seed": 17,
+        "position_bias_audit": true
+      }
+    }
+  ]
+}
