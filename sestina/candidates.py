@@ -120,7 +120,9 @@ def select_candidates(
         ),
         reverse=True,
     )
-    boundary_probability = by_quality[min(k - 1, len(by_quality) - 1)].pointwise.good_probability
+    boundary_probability = by_quality[
+        min(k - 1, len(by_quality) - 1)
+    ].pointwise.good_probability
     by_boundary = sorted(
         papers,
         key=lambda paper: (
@@ -233,10 +235,16 @@ def _round_robin_by_metadata(
 
 
 def _bucket_key(paper: Paper) -> str:
-    for key in ("topic", "venue", "source", "field", "category"):
+    for key in ("primary_category", "category", "topic", "venue", "field"):
         value = paper.metadata.get(key)
         if value:
             return f"{key}:{value}"
+    categories = paper.metadata.get("categories")
+    if isinstance(categories, (list, tuple)) and categories:
+        return f"category:{categories[0]}"
+    source = paper.metadata.get("source")
+    if source:
+        return f"source:{source}"
     return "unknown"
 
 
