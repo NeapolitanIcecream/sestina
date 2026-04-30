@@ -45,14 +45,14 @@ Known paid spend:
 | Earlier smoke and historical arXiv setup | USD 0.207235 |
 | 8-bucket historical arXiv pilot | USD 0.662340 |
 | Scheduler-only follow-up | USD 0.075705 |
-| Total known paid spend | USD 0.945280 |
+| Posterior top-K EVSI follow-up | USD 0.063945 |
+| Total known paid spend | USD 1.009225 |
 
-Remaining from the USD 100 cap: USD 99.054720.
+Remaining from the USD 100 cap: USD 98.990775.
 
 All paid phases used explicit dry-run estimates, provider-prefixed model names,
 model availability checks, JSONL ledgers, artifact directories, and hard
-`--max-usd` limits. The scheduler-only follow-up made 0 pointwise calls and only
-103 novel active pairwise calls.
+`--max-usd` limits. The scheduler-only follow-ups made 0 pointwise calls.
 
 ## Pilot Metrics
 
@@ -169,6 +169,54 @@ Metrics:
 The revised scheduler still beats pointwise-only, but it still trails the
 historical random pairwise reference.
 
+## Posterior Top-K EVSI Follow-Up
+
+After the scheduler-only follow-up, we implemented a decision-aware follow-up
+based on posterior top-K membership:
+
+- aggregate pointwise priors and pairwise labels with the existing Bayesian
+  Bradley-Terry MAP model;
+- sample approximate posterior top-K membership probabilities;
+- schedule pairs with a top-K EVSI-style boundary-duel heuristic;
+- score both the existing aggregate score and posterior top-K membership.
+
+Dry-run plan:
+
+- 160 scheduled active pairs.
+- 73 reused historical pairwise artifacts.
+- 87 novel active pairwise calls.
+- Estimated spend: USD 0.063945.
+
+Live follow-up:
+
+- 87 `pairwise_active` calls.
+- 87 ok.
+- Spend: USD 0.063945.
+
+Metrics:
+
+| Strategy | Recall@K | Precision@K | nDCG@K | AP | Brier |
+|---|---:|---:|---:|---:|---:|
+| Pointwise-only | 0.300 | 0.300 | 0.339587 | 0.356506 | 0.701230 |
+| Historical random pairwise, score aggregation | 0.350 | 0.350 | 0.393837 | 0.401054 | 0.702172 |
+| Historical random pairwise, posterior top-K | 0.375 | 0.375 | 0.412096 | 0.407579 | 0.053854 |
+| EVSI active pairwise, score aggregation | 0.325 | 0.325 | 0.366335 | 0.382875 | 0.701293 |
+| EVSI active pairwise, posterior top-K | 0.325 | 0.325 | 0.368193 | 0.389797 | 0.054995 |
+
+Interpretation:
+
+- Posterior top-K aggregation is useful. On historical random pairwise artifacts
+  it improves Recall@K from 0.350 to 0.375 and improves nDCG/AP.
+- Posterior top-K aggregation improves AP and probability calibration for EVSI
+  active pairwise, but it does not change the recovered EVSI top-K set enough
+  to improve Recall@K.
+- EVSI boundary dueling still beats pointwise-only, but it still trails the
+  historical random pairwise reference on Recall@K, nDCG@K, and AP.
+- The next obstacle is probably the acquisition policy, not posterior scoring.
+  The pair selector still needs a stronger way to identify decision-changing
+  outsider challengers or to use earlier pairwise outcomes adaptively within
+  each bucket.
+
 ## Conclusion
 
 The pointwise-first and pairwise-light design is worth keeping. The evidence is
@@ -185,9 +233,10 @@ solve candidate recall.
 Do not start a larger main run until the active scheduler has a stronger design
 argument or a better small-scale result against random pairwise.
 
-## Recommended Next Question
+## Current Next Question
 
-Ask for algorithmic advice before spending more budget. A compact prompt is:
+The next external algorithmic question should include the posterior top-K EVSI
+result, not just the quota scheduler result. A compact prompt is:
 
 ```text
 We are building Sestina, a pointwise-first, pairwise-light system for finding
@@ -205,6 +254,17 @@ metadata bucketing. We revised the scheduler to allocate boundary/candidate/
 sentinel/diversity quotas and ran a scheduler-only follow-up: revised active
 still beat pointwise-only but trailed random pairwise (Recall@K 0.325, nDCG@K
 0.3726, AP 0.3847).
+
+We then implemented posterior top-K aggregation and an EVSI-style boundary-duel
+scheduler. It scheduled 160 active pairs, reused 73 historical pairwise
+artifacts, made 87 new pairwise calls, and cost USD 0.063945. EVSI active
+pairwise with score aggregation reached Recall@K 0.325, nDCG@K 0.3663, AP
+0.3829. EVSI active pairwise with posterior top-K aggregation reached Recall@K
+0.325, nDCG@K 0.3682, AP 0.3898, with much better Brier score. It still did not
+beat the historical random pairwise reference. Offline, the same posterior
+top-K aggregation on historical random pairwise artifacts improved Recall@K to
+0.375, nDCG@K to 0.4121, and AP to 0.4076, so posterior scoring appears useful;
+the remaining failure is more likely in active pair acquisition.
 
 What algorithmic change should we try next? Focus on active pair selection,
 candidate construction, aggregation/posterior modeling, or a different

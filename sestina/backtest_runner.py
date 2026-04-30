@@ -23,7 +23,6 @@ from sestina.models import (
     Paper,
     PointwiseAssessment,
     ScheduledPair,
-    TargetSpec,
 )
 from sestina.scheduler import PairwiseBudget, resolve_pairwise_budget, schedule_pairs
 

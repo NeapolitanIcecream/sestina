@@ -72,6 +72,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="explicitly allow novel pairwise LLM calls after all guards pass",
     )
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument(
+        "--scheduler-kind",
+        choices=["quota", "evsi"],
+        default="quota",
+        help="active pair scheduler to use for the follow-up",
+    )
+    parser.add_argument(
+        "--aggregation-mode",
+        choices=["score", "posterior_topk", "both"],
+        default="score",
+        help="which aggregation outputs to score in bucket results",
+    )
     args = parser.parse_args(argv)
 
     runner = SchedulerOnlyRunner(
@@ -84,6 +96,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_usd=args.max_usd,
         confirm_paid=args.confirm_paid,
         seed=args.seed,
+        scheduler_kind=args.scheduler_kind,
+        aggregation_mode=args.aggregation_mode,
     )
     try:
         summary = runner.run()

@@ -40,6 +40,11 @@ from sestina.backtest_runner import (
 )
 from sestina.candidates import CandidateSelection, select_candidates
 from sestina.diagnostics import DiagnosticRecorder, fingerprint, write_json_artifact
+from sestina.evsi_scheduler import (
+    EVSISchedulerConfig,
+    posterior_top_k_predictions,
+    schedule_evsi_boundary_duels,
+)
 from sestina.models import (
     PairwiseComparison,
     PairwiseOrderMetadata,
@@ -99,6 +104,8 @@ class SchedulerOnlyRunner:
     max_usd: float = 0.50
     confirm_paid: bool = False
     seed: int = 17
+    scheduler_kind: str = "quota"
+    aggregation_mode: str = "score"
     timeout_seconds: float = 60.0
     urlopen: Any = urllib.request.urlopen
 
@@ -132,6 +139,7 @@ class SchedulerOnlyRunner:
                 source_artifact_dir=self.source_artifact_dir,
                 phase=self.phase,
                 seed=self.seed,
+                scheduler_kind=self.scheduler_kind,
             )
             for bucket in selected_buckets
         ]
@@ -159,6 +167,8 @@ class SchedulerOnlyRunner:
             "estimate_path": str(estimate_path),
             "budget_cap_usd": self.max_usd,
             "pairwise_model": pairwise_model,
+            "scheduler_kind": self.scheduler_kind,
+            "aggregation_mode": self.aggregation_mode,
             "estimated_spend_usd": totals["cost_usd"],
             "model_availability": {"status": "not_checked_dry_run"},
             "bucket_results": [],
@@ -203,6 +213,7 @@ class SchedulerOnlyRunner:
                 api_key=api_key,
                 base_url=base_url,
                 urlopen=urlopen,
+                aggregation_mode=self.aggregation_mode,
             )
             summary["bucket_results"].append(result)
 
@@ -229,6 +240,7 @@ class SchedulerOnlyRunner:
         api_key: str,
         base_url: str,
         urlopen: Any,
+        aggregation_mode: str,
     ) -> dict[str, Any]:
         bucket_dir = (
             self.artifact_dir
@@ -375,6 +387,7 @@ class SchedulerOnlyRunner:
             plan,
             comparisons=comparisons,
             artifact_path=bucket_dir / "bucket-result.json",
+            aggregation_mode=aggregation_mode,
         )
         result["calls"] = {
             "pointwise": 0,
@@ -430,6 +443,7 @@ def build_scheduler_only_bucket_plan(
     source_artifact_dir: Path,
     phase: str,
     seed: int,
+    scheduler_kind: str = "quota",
 ) -> SchedulerOnlyBucketPlan:
     papers = load_pointwise_papers_from_artifacts(
         bucket,
@@ -447,14 +461,27 @@ def build_scheduler_only_bucket_plan(
         candidate_size=len(selection.candidate_ids),
         diagnostics=diagnostics,
     )
-    schedule = schedule_pairs(
-        papers,
-        candidate_selection=selection,
-        k=bucket.k,
-        budget=budget,
-        seed=seed,
-        diagnostics=diagnostics,
-    )
+    if scheduler_kind == "quota":
+        schedule = schedule_pairs(
+            papers,
+            candidate_selection=selection,
+            k=bucket.k,
+            budget=budget,
+            seed=seed,
+            diagnostics=diagnostics,
+        )
+    elif scheduler_kind == "evsi":
+        schedule = schedule_evsi_boundary_duels(
+            papers,
+            [],
+            k=bucket.k,
+            budget=budget,
+            seed=seed,
+            diagnostics=diagnostics,
+            config=EVSISchedulerConfig(samples=1200),
+        )
+    else:
+        raise ValueError(f"unknown scheduler_kind {scheduler_kind!r}")
     reusable, reusable_stats = load_historical_pairwise_reuse_cache(
         bucket,
         papers=papers,
@@ -479,7 +506,10 @@ def build_scheduler_only_bucket_plan(
         bucket=bucket,
         papers=papers,
         schedule=schedule.pairs,
-        diagnostics=diagnostics.to_dict(),
+        diagnostics=_merged_schedule_diagnostics(
+            schedule.diagnostics,
+            diagnostics.to_dict(),
+        ),
         reusable_pairwise=reusable,
         reusable_stats=reusable_stats,
     )
@@ -1032,6 +1062,7 @@ def _bucket_metrics_payload(
     *,
     comparisons: list[PairwiseComparison],
     artifact_path: Path,
+    aggregation_mode: str,
 ) -> dict[str, Any]:
     strategies = {
         "pointwise_only": [
@@ -1044,6 +1075,18 @@ def _bucket_metrics_payload(
             pairwise_strength=2.5,
         ),
     }
+    if aggregation_mode in {"posterior_topk", "both"}:
+        posterior_predictions, posterior = posterior_top_k_predictions(
+            plan.papers,
+            comparisons,
+            k=plan.bucket.k,
+            pairwise_strength=2.5,
+            samples=2000,
+            seed=17,
+        )
+        strategies["sestina_active_posterior_topk"] = posterior_predictions
+    else:
+        posterior = None
     metrics = compare_strategies(
         strategies,
         relevant_ids=plan.bucket.relevant_ids,
@@ -1059,6 +1102,10 @@ def _bucket_metrics_payload(
         "strategies": {
             name: metric.to_dict() for name, metric in metrics.items()
         },
+        "aggregation_mode": aggregation_mode,
+        "posterior_topk_diagnostics": (
+            posterior.diagnostics if posterior is not None else None
+        ),
         "scheduler_diagnostics": plan.diagnostics,
         "reuse_stats": plan.reusable_stats,
         "artifact_path": str(artifact_path),
@@ -1090,6 +1137,24 @@ def _variant_metrics(
             pairwise_strength=pairwise_strength,
         ),
     }
+    random_topk, _ = posterior_top_k_predictions(
+        papers,
+        random_comparisons,
+        k=k,
+        pairwise_strength=pairwise_strength,
+        samples=2000,
+        seed=17,
+    )
+    active_topk, _ = posterior_top_k_predictions(
+        papers,
+        active_comparisons,
+        k=k,
+        pairwise_strength=pairwise_strength,
+        samples=2000,
+        seed=17,
+    )
+    strategies["pointwise_random_pairwise_posterior_topk"] = random_topk
+    strategies["sestina_active_pairwise_posterior_topk"] = active_topk
     return compare_strategies(strategies, relevant_ids=relevant_ids, k=k)
 
 
@@ -1344,6 +1409,9 @@ def _purpose_counts(schedule: list[ScheduledPair]) -> dict[str, int]:
 
 
 def _schedule_diagnostics_coverage(diagnostics: dict[str, Any]) -> dict[str, Any]:
+    coverage = diagnostics.get("coverage")
+    if isinstance(coverage, dict):
+        return coverage
     for event in diagnostics.get("events", []):
         if event.get("code") == "pair_scheduling_completed":
             data = event.get("data") or {}
@@ -1351,6 +1419,19 @@ def _schedule_diagnostics_coverage(diagnostics: dict[str, Any]) -> dict[str, Any
             if isinstance(coverage, dict):
                 return coverage
     return {}
+
+
+def _merged_schedule_diagnostics(
+    schedule_diagnostics: dict[str, Any],
+    recorder_diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    events = recorder_diagnostics.get("events", [])
+    if not isinstance(events, list):
+        events = []
+    return {
+        **schedule_diagnostics,
+        "events": events,
+    }
 
 
 def _mean_metric_rows(rows: list[dict[str, float | int]]) -> dict[str, float | int]:

@@ -204,6 +204,62 @@ def test_scheduler_only_reuses_duplicate_successful_pairwise_artifact(
     assert bucket_result["strategies"]["sestina_active_pairwise"]["k"] == 1
 
 
+def test_scheduler_only_evsi_mode_can_report_posterior_topk_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_config(tmp_path)
+    manifest_path = _write_manifest(tmp_path)
+    source_dir = tmp_path / "source"
+    _write_pointwise_artifacts(source_dir)
+
+    def fake_urlopen(request: Any, **kwargs: object) -> _FakeResponse:
+        if request.full_url.endswith("/models"):
+            return _FakeResponse({"data": [{"id": "openai/mini"}]})
+        return _FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "winner": "left",
+                                    "soft_probability": 0.82,
+                                    "confidence": 0.9,
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setenv("SESTINA_LLM_API_KEY", "secret")
+    monkeypatch.setenv("SESTINA_LLM_BASE_URL", "https://llm.example/v1")
+
+    summary = SchedulerOnlyRunner(
+        config_path=config_path,
+        manifest_path=manifest_path,
+        source_artifact_dir=source_dir,
+        artifact_dir=tmp_path / "followup",
+        ledger_path=tmp_path / "followup" / "ledger.jsonl",
+        max_usd=0.50,
+        confirm_paid=True,
+        scheduler_kind="evsi",
+        aggregation_mode="both",
+        urlopen=fake_urlopen,
+    ).run()
+
+    bucket_result = summary["bucket_results"][0]
+    assert bucket_result["scheduler_diagnostics"]["acquisition"]["method"] == (
+        "top_k_evsi_approximation"
+    )
+    assert "sestina_active_posterior_topk" in bucket_result["strategies"]
+    assert bucket_result["posterior_topk_diagnostics"]["method"] == (
+        "independent_laplace_normal_sampling"
+    )
+
+
 def _write_config(tmp_path: Path) -> Path:
     path = tmp_path / "config.json"
     path.write_text(
