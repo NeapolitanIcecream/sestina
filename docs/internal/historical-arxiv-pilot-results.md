@@ -46,9 +46,11 @@ Known paid spend:
 | 8-bucket historical arXiv pilot | USD 0.662340 |
 | Scheduler-only follow-up | USD 0.075705 |
 | Posterior top-K EVSI follow-up | USD 0.063945 |
-| Total known paid spend | USD 1.009225 |
+| Exact-pool random isolation | USD 0.098490 |
+| Sequential EVSI isolation | USD 0.063945 |
+| Total known paid spend | USD 1.171660 |
 
-Remaining from the USD 100 cap: USD 98.990775.
+Remaining from the USD 100 cap: USD 98.828340.
 
 All paid phases used explicit dry-run estimates, provider-prefixed model names,
 model availability checks, JSONL ledgers, artifact directories, and hard
@@ -217,7 +219,7 @@ Interpretation:
   outsider challengers or to use earlier pairwise outcomes adaptively within
   each bucket.
 
-## Sequential EVSI Isolation Dry-Run
+## Sequential EVSI Isolation Results
 
 Implemented the minimal isolation experiment for the acquisition-policy
 diagnosis:
@@ -228,8 +230,7 @@ diagnosis:
   EVSI proposal pool as the EVSI scheduler and samples randomly from that pool.
 - C: add `--scheduler-kind sequential_evsi`, which uses 5 rounds x 4 pairs per
   bucket, refits the posterior before each batch, selects the batch, and only
-  then reveals cached historical labels. Novel uncached pairs stop the dry-run
-  path rather than being treated as known.
+  then reveals cached historical or previously paid labels.
 
 New scheduler diagnostics are machine-readable in the follow-up estimate,
 summary, and offline bucket-result artifacts. They include unique papers
@@ -262,8 +263,8 @@ Dry-run results:
 
 | Arm | Scheduled pairs | Cached labels | Novel labels | Estimated cost | Status |
 |---|---:|---:|---:|---:|---|
-| Exact-pool random | 160 | 27 | 133 | USD 0.097755 | Blocked for valid full metrics |
-| Sequential EVSI | 32 | 11 | 21 | USD 0.015435 | Blocked after first novel batch per bucket |
+| Exact-pool random | 160 | 27 | 133 | USD 0.097755 | Ready for paid labeling |
+| Sequential EVSI first pass | 32 | 11 | 21 | USD 0.015435 | Ready for adaptive paid labeling |
 
 Partial offline metrics were computed only from cached labels and are not valid
 full-arm results:
@@ -275,10 +276,64 @@ full-arm results:
 | Sequential EVSI partial | Score | 0.300 | 0.336648 | 0.351298 |
 | Sequential EVSI partial | Posterior top-K | 0.300 | 0.341445 | 0.363506 |
 
-Blocker: a valid exact-pool random result needs 133 new pairwise labels under the
-current cache and seed. A valid sequential EVSI continuation needs at least the
-21 first-blocking novel labels, then the sequential dry-run must be rerun because
-later batches depend on those revealed outcomes. No paid calls were made.
+Live exact-pool random:
+
+- Artifact directory:
+  `artifacts/backtest-arxiv-exact-pool-random-live`.
+- Summary:
+  `artifacts/backtest-arxiv-exact-pool-random-live/summary-pilot.json`.
+- Ledger:
+  `artifacts/backtest-arxiv-exact-pool-random-live/ledger.jsonl`.
+- 160 scheduled pairs.
+- 27 historical pairwise labels reused.
+- 133 successful paid labels.
+- 1 malformed response was ledgered as `parse_error` and retried successfully.
+- Spend: USD 0.098490.
+
+Live sequential EVSI:
+
+- Artifact directory:
+  `artifacts/backtest-arxiv-sequential-evsi-live`.
+- Summary:
+  `artifacts/backtest-arxiv-sequential-evsi-live/summary-pilot.json`.
+- Ledger:
+  `artifacts/backtest-arxiv-sequential-evsi-live/ledger.jsonl`.
+- 160 scheduled pairs, 20 per bucket.
+- 74 historical pairwise labels reused.
+- 86 successful paid labels.
+- 1 provider response failure was ledgered and retried successfully.
+- Spend: USD 0.063945.
+- Completion status: `complete`.
+
+Full paid metrics:
+
+| Arm | Aggregation | Recall@K | Precision@K | nDCG@K | AP | Brier |
+|---|---|---:|---:|---:|---:|---:|
+| Pointwise-only | Score | 0.300 | 0.300 | 0.339587 | 0.356506 | 0.701230 |
+| Historical random pairwise | Posterior top-K | 0.375 | 0.375 | 0.412096 | 0.407579 | 0.053854 |
+| One-shot EVSI active | Posterior top-K | 0.325 | 0.325 | 0.368193 | 0.389797 | 0.054995 |
+| Exact-pool random | Score | 0.350 | 0.350 | 0.382736 | 0.384309 | 0.701440 |
+| Exact-pool random | Posterior top-K | 0.375 | 0.375 | 0.404687 | 0.381836 | 0.054963 |
+| Sequential EVSI | Score | 0.350 | 0.350 | 0.379797 | 0.384419 | 0.701404 |
+| Sequential EVSI | Posterior top-K | 0.325 | 0.325 | 0.365254 | 0.383471 | 0.053958 |
+
+Interpretation:
+
+- Exact-pool random matching the historical random posterior-top-K Recall@K
+  means the feasible EVSI pool contains enough useful comparisons to recover
+  the random-control hit rate. The pool is not empty or hopeless.
+- Exact-pool random still trails the historical random posterior-top-K nDCG and
+  AP, so pool construction and graph coverage may still be weaker than the
+  original global random control.
+- Sequential EVSI did not improve over one-shot EVSI. It refit the posterior
+  after each paid batch, but the final posterior-top-K result remained at
+  Recall@K 0.325 and slightly lower nDCG/AP than one-shot EVSI.
+- The stale one-shot explanation is therefore weak. The stronger diagnosis is an
+  acquisition-score issue: EVSI's ranking of pairs inside its own feasible pool
+  is worse than random sampling from that pool for this pilot.
+- Remaining uncertainty: this is still one seed and one 8-bucket pilot. However,
+  the isolation result is strong enough that the next scheduler change should
+  alter acquisition scoring, not only add adaptivity.
 
 ## Conclusion
 
@@ -289,12 +344,20 @@ random pairwise control.
 The likely algorithmic obstacle is that pairwise comparisons are only helpful
 when they expose pointwise errors that affect the top-K boundary. The current
 candidate construction and active schedule still do not reliably find enough
-positive outsiders or enough informative cross-cluster comparisons. Increasing
-pairwise strength can improve active nDCG on the old schedule, but it does not
-solve candidate recall.
+decision-changing comparisons. Increasing pairwise strength can improve active
+nDCG on the old schedule, but it does not solve candidate recall.
 
-Do not start a larger main run until the active scheduler has a stronger design
-argument or a better small-scale result against random pairwise.
+The sequential isolation experiment narrows the problem. Random sampling from
+the exact EVSI feasible pool reaches Recall@K 0.375 with posterior top-K, but
+EVSI's own acquisition ranking reaches only Recall@K 0.325 even after adaptive
+refits. That makes acquisition scoring the lead suspect. Pool/graph quality may
+still matter because exact-pool random trails the historical random posterior
+top-K nDCG/AP, but stale one-shot scoring is no longer a compelling primary
+explanation.
+
+Do not start a larger main run until the active scheduler has a changed
+acquisition objective and a better small-scale result against exact-pool random
+and historical random pairwise.
 
 ## Current Next Question
 
@@ -319,15 +382,29 @@ still beat pointwise-only but trailed random pairwise (Recall@K 0.325, nDCG@K
 0.3726, AP 0.3847).
 
 We then implemented posterior top-K aggregation and an EVSI-style boundary-duel
-scheduler. It scheduled 160 active pairs, reused 73 historical pairwise
-artifacts, made 87 new pairwise calls, and cost USD 0.063945. EVSI active
-pairwise with score aggregation reached Recall@K 0.325, nDCG@K 0.3663, AP
-0.3829. EVSI active pairwise with posterior top-K aggregation reached Recall@K
-0.325, nDCG@K 0.3682, AP 0.3898, with much better Brier score. It still did not
-beat the historical random pairwise reference. Offline, the same posterior
-top-K aggregation on historical random pairwise artifacts improved Recall@K to
-0.375, nDCG@K to 0.4121, and AP to 0.4076, so posterior scoring appears useful;
-the remaining failure is more likely in active pair acquisition.
+scheduler. One-shot EVSI scheduled 160 active pairs, reused 73 historical
+pairwise artifacts, made 87 new pairwise calls, and cost USD 0.063945. EVSI
+active pairwise with posterior top-K aggregation reached Recall@K 0.325, nDCG@K
+0.3682, AP 0.3898, with much better Brier score. It still did not beat the
+historical random pairwise reference. Offline, the same posterior top-K
+aggregation on historical random pairwise artifacts improved Recall@K to 0.375,
+nDCG@K to 0.4121, and AP to 0.4076, so posterior scoring appears useful.
+
+We then isolated the EVSI acquisition policy. Exact-pool random sampled from the
+same EVSI feasible pool, scheduled 160 pairs, made 133 successful paid labels
+plus one retried malformed response, and cost USD 0.098490. Exact-pool random
+with posterior top-K reached Recall@K 0.375, nDCG@K 0.4047, AP 0.3818.
+Cache-aware sequential EVSI refit after each paid batch, scheduled 160 pairs,
+made 86 successful paid labels plus one retried failed response, and cost USD
+0.063945.
+Sequential EVSI with posterior top-K reached Recall@K 0.325, nDCG@K 0.3653, AP
+0.3835.
+
+This implies the exact EVSI proposal pool has useful comparisons, but EVSI's
+acquisition score is choosing worse pairs than random sampling from that same
+pool. Adaptivity alone did not fix the failure, so stale one-shot scoring is
+not the primary blocker. Pool/graph quality remains a secondary concern because
+exact-pool random still trails historical random on nDCG/AP.
 
 What algorithmic change should we try next? Focus on active pair selection,
 candidate construction, aggregation/posterior modeling, or a different

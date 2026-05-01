@@ -141,6 +141,7 @@ class SchedulerOnlyRunner:
             build_scheduler_only_bucket_plan(
                 bucket,
                 source_artifact_dir=self.source_artifact_dir,
+                followup_artifact_dir=self.artifact_dir,
                 phase=self.phase,
                 seed=self.seed,
                 scheduler_kind=self.scheduler_kind,
@@ -193,8 +194,14 @@ class SchedulerOnlyRunner:
             plans=plans,
             call_estimate=estimate,
         )
-        if blocker:
+        if blocker and not self.confirm_paid:
             summary["blocker"] = blocker
+        sequential_completion = _sequential_evsi_completion_payload(
+            scheduler_kind=self.scheduler_kind,
+            plans=plans,
+        )
+        if sequential_completion is not None:
+            summary["sequential_evsi_completion"] = sequential_completion
 
         if not self.confirm_paid:
             offline_payload = _offline_bucket_results_payload(
@@ -211,12 +218,6 @@ class SchedulerOnlyRunner:
             write_json_artifact(summary_path, summary)
             return {**summary, "summary_path": str(summary_path)}
 
-        if self.scheduler_kind == "sequential_evsi" and totals["pairwise_novel_total"]:
-            raise PaidRunSafetyError(
-                "sequential_evsi paid execution is blocked because the dry-run "
-                "encountered novel pairs whose labels are needed before later "
-                "batches can be selected"
-            )
         _validate_scheduler_only_paid_preconditions(
             max_usd=self.max_usd,
             estimate_usd=float(totals["cost_usd"]),
@@ -349,6 +350,8 @@ class SchedulerOnlyRunner:
                     response=response,
                     subject={"left_id": pair.left_id, "right_id": pair.right_id},
                 )
+                artifact["comparison"] = comparison.to_dict()
+                artifact["scheduled_pair"] = pair.to_dict()
             except json.JSONDecodeError as exc:
                 status = "parse_error"
                 artifact = _call_artifact(
@@ -473,6 +476,7 @@ def build_scheduler_only_bucket_plan(
     bucket: BacktestBucket,
     *,
     source_artifact_dir: Path,
+    followup_artifact_dir: Path | None = None,
     phase: str,
     seed: int,
     scheduler_kind: str = "quota",
@@ -533,6 +537,13 @@ def build_scheduler_only_bucket_plan(
             phase=phase,
             seed=seed,
         )
+        reusable, reusable_stats = merge_followup_pairwise_reuse_cache(
+            bucket,
+            reusable_pairwise=reusable,
+            reusable_stats=reusable_stats,
+            followup_artifact_dir=followup_artifact_dir,
+            phase=phase,
+        )
 
         def reveal_cached(pair: ScheduledPair) -> PairwiseComparison | None:
             pair_key = canonical_pair_key(pair.left_id, pair.right_id)
@@ -582,6 +593,13 @@ def build_scheduler_only_bucket_plan(
             source_artifact_dir=source_artifact_dir,
             phase=phase,
             seed=seed,
+        )
+        reusable, reusable_stats = merge_followup_pairwise_reuse_cache(
+            bucket,
+            reusable_pairwise=reusable,
+            reusable_stats=reusable_stats,
+            followup_artifact_dir=followup_artifact_dir,
+            phase=phase,
         )
     schedule_keys = {
         canonical_pair_key(pair.left_id, pair.right_id) for pair in schedule.pairs
@@ -740,6 +758,144 @@ def load_historical_pairwise_reuse_cache(
         "successful_pairwise_by_kind": dict(sorted(by_kind.items())),
         "unique_reusable_pair_keys": len(reusable),
         "legacy_active_schedule_diagnostics": active_schedule.diagnostics,
+    }
+
+
+def merge_followup_pairwise_reuse_cache(
+    bucket: BacktestBucket,
+    *,
+    reusable_pairwise: dict[tuple[str, str], ReusablePairwiseArtifact],
+    reusable_stats: dict[str, Any],
+    followup_artifact_dir: Path | None,
+    phase: str,
+) -> tuple[dict[tuple[str, str], ReusablePairwiseArtifact], dict[str, Any]]:
+    followup_pairwise, followup_stats = load_followup_pairwise_reuse_cache(
+        bucket,
+        followup_artifact_dir=followup_artifact_dir,
+        phase=phase,
+    )
+    merged = dict(reusable_pairwise)
+    duplicate_with_prior = 0
+    for key, artifact in followup_pairwise.items():
+        if key in merged:
+            duplicate_with_prior += 1
+            continue
+        merged[key] = artifact
+
+    by_kind = Counter(
+        {
+            str(kind): int(total)
+            for kind, total in (
+                reusable_stats.get("successful_pairwise_by_kind") or {}
+            ).items()
+        }
+    )
+    by_kind.update(
+        {
+            str(kind): int(total)
+            for kind, total in (
+                followup_stats.get("successful_pairwise_by_kind") or {}
+            ).items()
+        }
+    )
+    combined_stats = {
+        **reusable_stats,
+        "successful_pairwise_artifacts": int(
+            reusable_stats.get("successful_pairwise_artifacts", 0)
+        )
+        + int(followup_stats.get("successful_pairwise_artifacts", 0)),
+        "duplicate_pair_keys": int(reusable_stats.get("duplicate_pair_keys", 0))
+        + int(followup_stats.get("duplicate_pair_keys", 0))
+        + duplicate_with_prior,
+        "successful_pairwise_by_kind": dict(sorted(by_kind.items())),
+        "unique_reusable_pair_keys": len(merged),
+        "followup_reuse_stats": {
+            **followup_stats,
+            "duplicate_with_prior_reuse_total": duplicate_with_prior,
+        },
+    }
+    return merged, combined_stats
+
+
+def load_followup_pairwise_reuse_cache(
+    bucket: BacktestBucket,
+    *,
+    followup_artifact_dir: Path | None,
+    phase: str,
+) -> tuple[dict[tuple[str, str], ReusablePairwiseArtifact], dict[str, Any]]:
+    reusable: dict[tuple[str, str], ReusablePairwiseArtifact] = {}
+    stats = Counter(
+        {
+            "successful_pairwise_artifacts": 0,
+            "duplicate_pair_keys": 0,
+            "missing_or_failed_total": 0,
+            "subject_mismatch_total": 0,
+            "missing_comparison_total": 0,
+            "malformed_comparison_total": 0,
+        }
+    )
+    by_kind: Counter[str] = Counter()
+    if followup_artifact_dir is None:
+        return reusable, {
+            **dict(stats),
+            "successful_pairwise_by_kind": {},
+            "unique_reusable_pair_keys": 0,
+        }
+
+    calls_dir = _source_calls_dir(
+        followup_artifact_dir,
+        phase=phase,
+        bucket_name=bucket.name,
+    )
+    if not calls_dir.exists():
+        return reusable, {
+            **dict(stats),
+            "successful_pairwise_by_kind": {},
+            "unique_reusable_pair_keys": 0,
+        }
+
+    for path in sorted(calls_dir.glob("*-pairwise_active-*.json")):
+        cached = _load_ok_call_artifact(path)
+        if cached is None:
+            stats["missing_or_failed_total"] += 1
+            continue
+        subject = cached.get("subject") or {}
+        left_id = subject.get("left_id")
+        right_id = subject.get("right_id")
+        if left_id is None or right_id is None:
+            stats["subject_mismatch_total"] += 1
+            continue
+        pair_key = canonical_pair_key(str(left_id), str(right_id))
+        comparison_payload = cached.get("comparison")
+        if not isinstance(comparison_payload, dict):
+            stats["missing_comparison_total"] += 1
+            continue
+        try:
+            comparison = PairwiseComparison.from_dict(comparison_payload)
+        except ValueError:
+            stats["malformed_comparison_total"] += 1
+            continue
+        if canonical_pair_key(comparison.left_id, comparison.right_id) != pair_key:
+            stats["subject_mismatch_total"] += 1
+            continue
+
+        stats["successful_pairwise_artifacts"] += 1
+        by_kind["pairwise_active_followup"] += 1
+        if pair_key in reusable:
+            stats["duplicate_pair_keys"] += 1
+            continue
+        reusable[pair_key] = ReusablePairwiseArtifact(
+            bucket=bucket.name,
+            pair_key=pair_key,
+            comparison=comparison,
+            artifact_path=path,
+            kind="pairwise_active_followup",
+        )
+
+    return reusable, {
+        **dict(stats),
+        "successful_pairwise_by_kind": dict(sorted(by_kind.items())),
+        "unique_reusable_pair_keys": len(reusable),
     }
 
 
@@ -1184,9 +1340,60 @@ def _scheduler_only_blocker_payload(
             "dry-run records novel pairs but does not pretend labels are known"
         ),
         "recommended_action": (
-            "review the dry-run novel pairs and run a guarded paid labeling pass "
-            "only after supervisor approval"
+            "run a guarded paid labeling pass with --confirm-paid after the "
+            "dry-run estimate is within budget"
         ),
+    }
+
+
+def _sequential_evsi_completion_payload(
+    *,
+    scheduler_kind: str,
+    plans: list[SchedulerOnlyBucketPlan],
+) -> dict[str, Any] | None:
+    if scheduler_kind != "sequential_evsi":
+        return None
+
+    buckets = []
+    complete_count = 0
+    for plan in plans:
+        diagnostics = plan.diagnostics
+        acquisition = diagnostics.get("acquisition") or {}
+        budget = int(diagnostics.get("budget") or len(plan.schedule))
+        rounds = int(acquisition.get("rounds") or 0)
+        batch_size = max(1, int(acquisition.get("batch_size") or 1))
+        target_pairs = budget
+        if rounds > 0:
+            target_pairs = min(budget, rounds * batch_size)
+        scheduled_total = int(
+            diagnostics.get("scheduled_total") or len(plan.schedule)
+        )
+        stopped_on_novel = bool(diagnostics.get("stopped_on_novel", False))
+        complete = scheduled_total >= target_pairs or not stopped_on_novel
+        if complete:
+            complete_count += 1
+        buckets.append(
+            {
+                "bucket": plan.bucket.name,
+                "scheduled_total": scheduled_total,
+                "target_pairs": target_pairs,
+                "stopped_on_novel": stopped_on_novel,
+                "current_invocation_novel_pairs": plan.reusable_stats[
+                    "scheduled_novel_total"
+                ],
+                "complete": complete,
+            }
+        )
+
+    return {
+        "status": (
+            "complete"
+            if complete_count == len(plans)
+            else "needs_guarded_paid_resume"
+        ),
+        "complete_bucket_count": complete_count,
+        "bucket_count": len(plans),
+        "buckets": buckets,
     }
 
 

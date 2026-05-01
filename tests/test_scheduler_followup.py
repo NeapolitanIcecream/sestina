@@ -288,6 +288,90 @@ def test_scheduler_only_exact_pool_random_mode_reports_pool_diagnostics(
     assert "offline_bucket_results_path" in summary
 
 
+def test_scheduler_only_sequential_evsi_paid_resume_reveals_followup_labels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sequential EVSI resumes by revealing labels paid in prior invocations."""
+    config_path = _write_config(tmp_path)
+    papers = _many_manifest_papers(n=32, k=5)
+    manifest_path = _write_manifest_for_papers(tmp_path, papers=papers, k=5)
+    source_dir = tmp_path / "source"
+    _write_pointwise_artifacts_for_papers(source_dir, papers=papers)
+    chat_calls = 0
+
+    def fake_urlopen(request: Any, **kwargs: object) -> _FakeResponse:
+        nonlocal chat_calls
+        if request.full_url.endswith("/models"):
+            return _FakeResponse({"data": [{"id": "openai/mini"}]})
+        chat_calls += 1
+        return _FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "winner": "left",
+                                    "soft_probability": 0.82,
+                                    "confidence": 0.9,
+                                    "reasons": ["fixture pairwise judgment"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setenv("SESTINA_LLM_API_KEY", "secret")
+    monkeypatch.setenv("SESTINA_LLM_BASE_URL", "https://llm.example/v1")
+
+    artifact_dir = tmp_path / "followup"
+    ledger_path = artifact_dir / "ledger.jsonl"
+    first = SchedulerOnlyRunner(
+        config_path=config_path,
+        manifest_path=manifest_path,
+        source_artifact_dir=source_dir,
+        artifact_dir=artifact_dir,
+        ledger_path=ledger_path,
+        max_usd=0.50,
+        confirm_paid=True,
+        scheduler_kind="sequential_evsi",
+        aggregation_mode="posterior_topk",
+        urlopen=fake_urlopen,
+    ).run()
+
+    assert first["pairwise_scheduled_total"] == 4
+    assert first["pairwise_novel_total"] == 4
+    assert first["new_ledger_entries_this_invocation"] == 4
+    assert first["sequential_evsi_completion"]["status"] == (
+        "needs_guarded_paid_resume"
+    )
+    assert chat_calls == 4
+
+    second = SchedulerOnlyRunner(
+        config_path=config_path,
+        manifest_path=manifest_path,
+        source_artifact_dir=source_dir,
+        artifact_dir=artifact_dir,
+        ledger_path=ledger_path,
+        max_usd=0.50,
+        scheduler_kind="sequential_evsi",
+        aggregation_mode="posterior_topk",
+        urlopen=fake_urlopen,
+    ).run()
+
+    assert second["pairwise_scheduled_total"] == 8
+    assert second["pairwise_reused_total"] == 4
+    assert second["pairwise_novel_total"] == 4
+    assert second["sequential_evsi_completion"]["status"] == "complete"
+    diagnostics = second["offline_bucket_results"][0]["scheduler_diagnostics"]
+    assert diagnostics["batch_history"][0]["cached_label_revealed_total"] == 4
+    assert diagnostics["batch_history"][1]["novel_pairs_total"] == 4
+    assert chat_calls == 4
+
+
 def _write_config(tmp_path: Path) -> Path:
     path = tmp_path / "config.json"
     path.write_text(
@@ -322,6 +406,49 @@ def _write_config(tmp_path: Path) -> Path:
                             "sestina_active_pairwise",
                         ],
                         "buckets": [{"name": "tiny_bucket", "n": 2, "k": 1}],
+                    }
+                ],
+            }
+        )
+    )
+    return path
+
+
+def _many_manifest_papers(*, n: int, k: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "paper_id": f"p{index:02d}",
+            "title": f"Paper {index}",
+            "abstract": f"Abstract for paper {index}.",
+            "baseline_score": max(0.05, 0.96 - (index * 0.02)),
+            "uncertainty": min(0.9, 0.2 + (index * 0.01)),
+            "labels": {"good_paper": index <= k},
+            "metadata": {
+                "primary_category": "cs.LG" if index % 2 else "cs.CL",
+                "source": "arxiv",
+            },
+        }
+        for index in range(1, n + 1)
+    ]
+
+
+def _write_manifest_for_papers(
+    tmp_path: Path,
+    *,
+    papers: list[dict[str, Any]],
+    k: int,
+) -> Path:
+    path = tmp_path / "manifest-many.json"
+    path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "sestina-backtest-dataset-manifest",
+                "buckets": [
+                    {
+                        "name": "tiny_bucket",
+                        "phase": "pilot",
+                        "k": k,
+                        "papers": papers,
                     }
                 ],
             }
@@ -407,6 +534,36 @@ def _write_pointwise_artifacts(
                     "kind": "pointwise",
                     "status": "ok",
                     "response": responses[paper_id],
+                    "subject": {"paper_id": paper_id},
+                }
+            )
+        )
+
+
+def _write_pointwise_artifacts_for_papers(
+    source_dir: Path,
+    *,
+    papers: list[dict[str, Any]],
+) -> None:
+    calls_dir = source_dir / "pilot" / "tiny_bucket" / "calls"
+    calls_dir.mkdir(parents=True, exist_ok=True)
+    for index, paper in enumerate(papers, start=1):
+        paper_id = str(paper["paper_id"])
+        path = calls_dir / f"{index:04d}-pointwise-{fingerprint(paper_id)}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "artifact_type": "sestina-backtest-call",
+                    "phase": "pilot",
+                    "bucket": "tiny_bucket",
+                    "model": "openai/mini",
+                    "kind": "pointwise",
+                    "status": "ok",
+                    "response": PointwiseAssessment(
+                        good_probability=float(paper["baseline_score"]),
+                        uncertainty=float(paper["uncertainty"]),
+                        summary="fixture",
+                    ).to_dict(),
                     "subject": {"paper_id": paper_id},
                 }
             )
