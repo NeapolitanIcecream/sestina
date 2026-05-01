@@ -4,7 +4,8 @@ import itertools
 import math
 import random
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 from sestina.aggregation import AggregationConfig, aggregate
@@ -34,6 +35,14 @@ class EVSISchedulerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class SequentialEVSISchedulerConfig:
+    evsi: EVSISchedulerConfig = field(default_factory=EVSISchedulerConfig)
+    rounds: int = 5
+    batch_size: int = 4
+    stop_on_novel: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class _PosteriorItem:
     paper_id: str
     mean: float
@@ -53,6 +62,14 @@ class _AcquisitionProposal:
     score: float
     purpose: str
     diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _EVSIContext:
+    posterior: TopKPosterior
+    items: list[_PosteriorItem]
+    pool: list[_PosteriorItem]
+    proposals: list[_AcquisitionProposal]
 
 
 def posterior_top_k_predictions(
@@ -101,7 +118,11 @@ def schedule_evsi_boundary_duels(
     recorder = diagnostics or DiagnosticRecorder()
     paper_by_id = {paper.paper_id: paper for paper in papers}
     if budget.budget <= 0 or len(paper_by_id) < 2 or k <= 0:
-        payload = _empty_schedule_diagnostics(k=k, budget=budget.budget)
+        payload = _empty_schedule_diagnostics(
+            k=k,
+            budget=budget.budget,
+            method="top_k_evsi_approximation",
+        )
         recorder.record(
             step="pair_scheduling",
             code="evsi_pair_scheduling_empty",
@@ -110,56 +131,41 @@ def schedule_evsi_boundary_duels(
         )
         return PairSchedule(pairs=[], budget=budget, diagnostics=payload)
 
-    aggregation = aggregate(
-        papers,
-        comparisons,
-        config=AggregationConfig(pairwise_strength=cfg.pairwise_strength),
-        diagnostics=recorder,
-    )
-    posterior = estimate_top_k_probabilities(
-        aggregation,
-        k=k,
-        samples=cfg.samples,
-        seed=seed,
-        diagnostics=recorder,
-    )
-    items = _posterior_items(
-        papers,
-        aggregation=aggregation,
-        posterior=posterior,
-        k=k,
-        config=cfg,
-    )
-    pool = _dynamic_proposal_pool(items, k=k, config=cfg)
     seen_pairs = {
         _pair_key(comparison.left_id, comparison.right_id)
         for comparison in comparisons
     }
-    proposals = _evsi_proposals(
-        pool,
-        paper_by_id=paper_by_id,
-        seen_pairs=seen_pairs,
+    context = _build_evsi_context(
+        papers,
+        comparisons=comparisons,
+        k=k,
+        seed=seed,
         config=cfg,
+        seen_pairs=seen_pairs,
+        diagnostics=recorder,
     )
     scheduled = _select_evsi_pairs(
-        proposals,
+        context.proposals,
         budget=budget.budget,
         seed=seed,
         calibration_fraction=cfg.calibration_fraction,
         per_item_cap=cfg.per_item_cap,
     )
     payload = {
-        "candidate_count": len(pool),
+        "candidate_count": len(context.pool),
         "scheduled_total": len(scheduled),
-        "pairs_considered": len(proposals),
+        "pairs_considered": len(context.proposals),
         "unique_pairs_considered": len(
-            {_pair_key(proposal.left_id, proposal.right_id) for proposal in proposals}
+            {
+                _pair_key(proposal.left_id, proposal.right_id)
+                for proposal in context.proposals
+            }
         ),
         "budget": budget.budget,
         "k": k,
         "posterior": {
-            "samples": posterior.samples,
-            "average_top_k_probability": posterior.diagnostics.get(
+            "samples": context.posterior.samples,
+            "average_top_k_probability": context.posterior.diagnostics.get(
                 "average_top_k_probability"
             ),
         },
@@ -174,8 +180,15 @@ def schedule_evsi_boundary_duels(
         ),
         "coverage": _evsi_coverage(
             scheduled,
-            item_by_id={item.paper_id: item for item in items},
+            item_by_id={item.paper_id: item for item in context.items},
         ),
+        "proposal_pool_profile": _proposal_pool_profile(
+            items=context.items,
+            pool=context.pool,
+            scheduled=scheduled,
+            k=k,
+        ),
+        "evsi_score_distribution": _evsi_score_distribution(context.proposals),
     }
     recorder.record(
         step="pair_scheduling",
@@ -184,6 +197,369 @@ def schedule_evsi_boundary_duels(
         data=payload,
     )
     return PairSchedule(pairs=scheduled, budget=budget, diagnostics=payload)
+
+
+def schedule_exact_pool_random(
+    papers: list[Paper],
+    comparisons: list[PairwiseComparison],
+    *,
+    k: int,
+    budget: PairwiseBudget,
+    seed: int = 0,
+    config: EVSISchedulerConfig | None = None,
+    diagnostics: DiagnosticRecorder | None = None,
+) -> PairSchedule:
+    """Randomly sample from the exact feasible EVSI proposal pool."""
+    cfg = config or EVSISchedulerConfig()
+    recorder = diagnostics or DiagnosticRecorder()
+    paper_by_id = {paper.paper_id: paper for paper in papers}
+    if budget.budget <= 0 or len(paper_by_id) < 2 or k <= 0:
+        payload = _empty_schedule_diagnostics(
+            k=k,
+            budget=budget.budget,
+            method="exact_pool_random",
+        )
+        payload["acquisition"]["source_method"] = "top_k_evsi_approximation"
+        recorder.record(
+            step="pair_scheduling",
+            code="exact_pool_random_pair_scheduling_empty",
+            message="no exact-pool random comparisons scheduled",
+            data=payload,
+        )
+        return PairSchedule(pairs=[], budget=budget, diagnostics=payload)
+
+    seen_pairs = {
+        _pair_key(comparison.left_id, comparison.right_id)
+        for comparison in comparisons
+    }
+    context = _build_evsi_context(
+        papers,
+        comparisons=comparisons,
+        k=k,
+        seed=seed,
+        config=cfg,
+        seen_pairs=seen_pairs,
+        diagnostics=recorder,
+    )
+    scheduled = _select_random_evsi_pairs(
+        context.proposals,
+        budget=budget.budget,
+        seed=seed,
+        per_item_cap=cfg.per_item_cap,
+    )
+    payload = {
+        "candidate_count": len(context.pool),
+        "scheduled_total": len(scheduled),
+        "pairs_considered": len(context.proposals),
+        "unique_pairs_considered": len(
+            {
+                _pair_key(proposal.left_id, proposal.right_id)
+                for proposal in context.proposals
+            }
+        ),
+        "budget": budget.budget,
+        "k": k,
+        "posterior": {
+            "samples": context.posterior.samples,
+            "average_top_k_probability": context.posterior.diagnostics.get(
+                "average_top_k_probability"
+            ),
+        },
+        "acquisition": {
+            "method": "exact_pool_random",
+            "source_method": "top_k_evsi_approximation",
+            "random_seed": seed,
+            "per_item_cap": cfg.per_item_cap,
+            "pool_multiplier": cfg.pool_multiplier,
+        },
+        "purpose_counts": dict(
+            sorted(Counter(pair.purpose for pair in scheduled).items())
+        ),
+        "coverage": _evsi_coverage(
+            scheduled,
+            item_by_id={item.paper_id: item for item in context.items},
+        ),
+        "proposal_pool_profile": _proposal_pool_profile(
+            items=context.items,
+            pool=context.pool,
+            scheduled=scheduled,
+            k=k,
+        ),
+        "evsi_score_distribution": _evsi_score_distribution(context.proposals),
+        "batch_history": [
+            {
+                "batch_index": 1,
+                "selected_total": len(scheduled),
+                "cached_label_revealed_total": 0,
+                "novel_pairs_total": 0,
+                "top_k_entropy_reduction": None,
+                "top_k_set_churn": None,
+                "note": "random control schedules one offline batch without label reveal",
+            }
+        ],
+    }
+    recorder.record(
+        step="pair_scheduling",
+        code="exact_pool_random_pair_scheduling_completed",
+        message="randomly sampled exact EVSI feasible proposal pool",
+        data=payload,
+    )
+    return PairSchedule(pairs=scheduled, budget=budget, diagnostics=payload)
+
+
+def schedule_cache_aware_sequential_evsi(
+    papers: list[Paper],
+    comparisons: list[PairwiseComparison],
+    *,
+    reveal_comparison: Callable[[ScheduledPair], PairwiseComparison | None],
+    k: int,
+    budget: PairwiseBudget,
+    seed: int = 0,
+    config: SequentialEVSISchedulerConfig | None = None,
+    diagnostics: DiagnosticRecorder | None = None,
+) -> PairSchedule:
+    """Select EVSI pairs in batches, revealing cached labels after selection."""
+    cfg = config or SequentialEVSISchedulerConfig()
+    evsi_cfg = cfg.evsi
+    recorder = diagnostics or DiagnosticRecorder()
+    paper_by_id = {paper.paper_id: paper for paper in papers}
+    if budget.budget <= 0 or len(paper_by_id) < 2 or k <= 0:
+        payload = _empty_schedule_diagnostics(
+            k=k,
+            budget=budget.budget,
+            method="cache_aware_sequential_evsi",
+        )
+        payload.update(
+            {
+                "batch_history": [],
+                "cached_label_revealed_total": 0,
+                "novel_pairs_total": 0,
+                "stopped_on_novel": False,
+            }
+        )
+        recorder.record(
+            step="pair_scheduling",
+            code="sequential_evsi_pair_scheduling_empty",
+            message="no sequential EVSI comparisons scheduled",
+            data=payload,
+        )
+        return PairSchedule(pairs=[], budget=budget, diagnostics=payload)
+
+    revealed_comparisons = list(comparisons)
+    selected_pairs: list[ScheduledPair] = []
+    selected_keys: set[tuple[str, str]] = {
+        _pair_key(comparison.left_id, comparison.right_id)
+        for comparison in comparisons
+    }
+    batch_history: list[dict[str, Any]] = []
+    all_proposals: list[_AcquisitionProposal] = []
+    cached_revealed_total = 0
+    novel_total = 0
+    stopped_on_novel = False
+    last_items: list[_PosteriorItem] = []
+    last_pool: list[_PosteriorItem] = []
+
+    max_rounds = max(0, int(cfg.rounds))
+    batch_size = max(1, int(cfg.batch_size))
+    for batch_index in range(max_rounds):
+        remaining_budget = budget.budget - len(selected_pairs)
+        if remaining_budget <= 0:
+            break
+        batch_budget = min(batch_size, remaining_budget)
+        batch_seed = seed + (batch_index * 9973)
+        context = _build_evsi_context(
+            papers,
+            comparisons=revealed_comparisons,
+            k=k,
+            seed=batch_seed,
+            config=evsi_cfg,
+            seen_pairs=selected_keys,
+            diagnostics=recorder,
+        )
+        last_items = context.items
+        last_pool = context.pool
+        all_proposals.extend(context.proposals)
+        before_entropy = _posterior_top_k_entropy(context.posterior)
+        before_top_k = _posterior_top_k_set(context.posterior, k=k)
+        batch_pairs = _select_evsi_pairs(
+            context.proposals,
+            budget=batch_budget,
+            seed=batch_seed,
+            calibration_fraction=evsi_cfg.calibration_fraction,
+            per_item_cap=evsi_cfg.per_item_cap,
+            start_index=len(selected_pairs),
+        )
+        batch_pairs = [
+            _annotate_batch_pair(
+                pair,
+                batch_index=batch_index + 1,
+                global_index=len(selected_pairs) + offset,
+            )
+            for offset, pair in enumerate(batch_pairs)
+        ]
+        if not batch_pairs:
+            batch_history.append(
+                {
+                    "batch_index": batch_index + 1,
+                    "selected_total": 0,
+                    "comparisons_before_batch": len(revealed_comparisons),
+                    "comparisons_after_batch": len(revealed_comparisons),
+                    "proposal_count": len(context.proposals),
+                    "top_k_entropy_before": before_entropy,
+                    "top_k_entropy_after": before_entropy,
+                    "top_k_entropy_reduction": 0.0,
+                    "top_k_set_churn": 0.0,
+                    "stop_reason": "no_feasible_pairs",
+                }
+            )
+            break
+
+        selected_pairs.extend(batch_pairs)
+        selected_keys.update(_pair_key(pair.left_id, pair.right_id) for pair in batch_pairs)
+        cached_in_batch = 0
+        novel_in_batch = 0
+        for pair in batch_pairs:
+            comparison = reveal_comparison(pair)
+            if comparison is None:
+                novel_in_batch += 1
+                continue
+            revealed_comparisons.append(_orient_revealed_comparison(comparison, pair))
+            cached_in_batch += 1
+
+        cached_revealed_total += cached_in_batch
+        novel_total += novel_in_batch
+        if cached_in_batch:
+            after_context = _build_evsi_context(
+                papers,
+                comparisons=revealed_comparisons,
+                k=k,
+                seed=batch_seed + 1,
+                config=evsi_cfg,
+                seen_pairs=selected_keys,
+                diagnostics=recorder,
+            )
+            after_entropy = _posterior_top_k_entropy(after_context.posterior)
+            after_top_k = _posterior_top_k_set(after_context.posterior, k=k)
+            last_items = after_context.items
+            last_pool = after_context.pool
+        else:
+            after_entropy = before_entropy
+            after_top_k = before_top_k
+        batch_history.append(
+            {
+                "batch_index": batch_index + 1,
+                "selected_total": len(batch_pairs),
+                "cached_label_revealed_total": cached_in_batch,
+                "novel_pairs_total": novel_in_batch,
+                "comparisons_before_batch": len(revealed_comparisons) - cached_in_batch,
+                "comparisons_after_batch": len(revealed_comparisons),
+                "proposal_count": len(context.proposals),
+                "top_k_entropy_before": before_entropy,
+                "top_k_entropy_after": after_entropy,
+                "top_k_entropy_reduction": round(before_entropy - after_entropy, 8),
+                "top_k_set_churn": _top_k_set_churn(before_top_k, after_top_k),
+                "stop_reason": (
+                    "novel_pair_without_revealed_label"
+                    if novel_in_batch and cfg.stop_on_novel
+                    else None
+                ),
+            }
+        )
+        if novel_in_batch and cfg.stop_on_novel:
+            stopped_on_novel = True
+            break
+
+    payload = {
+        "candidate_count": len({item.paper_id for item in last_items}),
+        "scheduled_total": len(selected_pairs),
+        "pairs_considered": len(all_proposals),
+        "unique_pairs_considered": len(
+            {_pair_key(proposal.left_id, proposal.right_id) for proposal in all_proposals}
+        ),
+        "budget": budget.budget,
+        "k": k,
+        "acquisition": {
+            "method": "cache_aware_sequential_evsi",
+            "source_method": "top_k_evsi_approximation",
+            "rounds": cfg.rounds,
+            "batch_size": cfg.batch_size,
+            "stop_on_novel": cfg.stop_on_novel,
+            "pool_multiplier": evsi_cfg.pool_multiplier,
+            "calibration_fraction": evsi_cfg.calibration_fraction,
+        },
+        "purpose_counts": dict(
+            sorted(Counter(pair.purpose for pair in selected_pairs).items())
+        ),
+        "coverage": _evsi_coverage(
+            selected_pairs,
+            item_by_id={item.paper_id: item for item in last_items},
+        ),
+        "proposal_pool_profile": _proposal_pool_profile(
+            items=last_items,
+            pool=last_pool,
+            scheduled=selected_pairs,
+            k=k,
+        ),
+        "evsi_score_distribution": _evsi_score_distribution(all_proposals),
+        "batch_history": batch_history,
+        "cached_label_revealed_total": cached_revealed_total,
+        "novel_pairs_total": novel_total,
+        "stopped_on_novel": stopped_on_novel,
+        "known_comparisons_final": len(revealed_comparisons),
+    }
+    recorder.record(
+        step="pair_scheduling",
+        code="sequential_evsi_pair_scheduling_completed",
+        message="scheduled cache-aware sequential EVSI comparisons",
+        data=payload,
+    )
+    return PairSchedule(pairs=selected_pairs, budget=budget, diagnostics=payload)
+
+
+def _build_evsi_context(
+    papers: list[Paper],
+    *,
+    comparisons: list[PairwiseComparison],
+    k: int,
+    seed: int,
+    config: EVSISchedulerConfig,
+    seen_pairs: set[tuple[str, str]],
+    diagnostics: DiagnosticRecorder,
+) -> _EVSIContext:
+    paper_by_id = {paper.paper_id: paper for paper in papers}
+    aggregation = aggregate(
+        papers,
+        comparisons,
+        config=AggregationConfig(pairwise_strength=config.pairwise_strength),
+        diagnostics=diagnostics,
+    )
+    posterior = estimate_top_k_probabilities(
+        aggregation,
+        k=k,
+        samples=config.samples,
+        seed=seed,
+        diagnostics=diagnostics,
+    )
+    items = _posterior_items(
+        papers,
+        aggregation=aggregation,
+        posterior=posterior,
+        k=k,
+        config=config,
+    )
+    pool = _dynamic_proposal_pool(items, k=k, config=config)
+    proposals = _evsi_proposals(
+        pool,
+        paper_by_id=paper_by_id,
+        seen_pairs=seen_pairs,
+        config=config,
+    )
+    return _EVSIContext(
+        posterior=posterior,
+        items=items,
+        pool=pool,
+        proposals=proposals,
+    )
 
 
 def _posterior_items(
@@ -330,6 +706,10 @@ def _evsi_proposals(
                     "metadata_diverse": metadata_diverse,
                     "left_top_k_probability": round(left.top_k_probability, 8),
                     "right_top_k_probability": round(right.top_k_probability, 8),
+                    "left_ucb": round(left.ucb, 8),
+                    "right_ucb": round(right.ucb, 8),
+                    "left_mean_rank": round(left.mean_rank, 8),
+                    "right_mean_rank": round(right.mean_rank, 8),
                     "left_boundary_mass": round(left.boundary_mass, 8),
                     "right_boundary_mass": round(right.boundary_mass, 8),
                     "left_metadata_bucket": left.metadata_bucket,
@@ -353,6 +733,7 @@ def _select_evsi_pairs(
     seed: int,
     calibration_fraction: float,
     per_item_cap: int | None,
+    start_index: int = 0,
 ) -> list[ScheduledPair]:
     if budget <= 0:
         return []
@@ -401,19 +782,94 @@ def _select_evsi_pairs(
             selected.append(proposal)
             selected_keys.add(key)
 
+    return _scheduled_pairs_from_proposals(
+        selected[:budget],
+        seed=seed,
+        start_index=start_index,
+    )
+
+
+def _select_random_evsi_pairs(
+    proposals: list[_AcquisitionProposal],
+    *,
+    budget: int,
+    seed: int,
+    per_item_cap: int | None,
+) -> list[ScheduledPair]:
+    if budget <= 0:
+        return []
+    rng = random.Random(seed)
+    candidates = list(proposals)
+    rng.shuffle(candidates)
+    selected: list[_AcquisitionProposal] = []
+    selected_keys: set[tuple[str, str]] = set()
+    item_counts: Counter[str] = Counter()
+    cap = per_item_cap or max(
+        2,
+        math.ceil((2.5 * budget) / max(1, len(proposals) ** 0.5)),
+    )
+    for proposal in candidates:
+        if len(selected) >= budget:
+            break
+        key = _pair_key(proposal.left_id, proposal.right_id)
+        if key in selected_keys:
+            continue
+        if item_counts[proposal.left_id] >= cap or item_counts[proposal.right_id] >= cap:
+            continue
+        selected.append(proposal)
+        selected_keys.add(key)
+        item_counts[proposal.left_id] += 1
+        item_counts[proposal.right_id] += 1
+
+    if len(selected) < budget:
+        for proposal in candidates:
+            if len(selected) >= budget:
+                break
+            key = _pair_key(proposal.left_id, proposal.right_id)
+            if key in selected_keys:
+                continue
+            selected.append(proposal)
+            selected_keys.add(key)
+
+    return _scheduled_pairs_from_proposals(
+        selected[:budget],
+        seed=seed,
+        purpose_override="exact_pool_random",
+        priority_override=0.0,
+        source_purpose_key="source_evsi_purpose",
+    )
+
+
+def _scheduled_pairs_from_proposals(
+    proposals: list[_AcquisitionProposal],
+    *,
+    seed: int,
+    start_index: int = 0,
+    purpose_override: str | None = None,
+    priority_override: float | None = None,
+    source_purpose_key: str | None = None,
+) -> list[ScheduledPair]:
     rng = random.Random(seed)
     scheduled: list[ScheduledPair] = []
-    for index, proposal in enumerate(selected[:budget]):
+    for offset, proposal in enumerate(proposals):
+        index = start_index + offset
         if rng.random() < 0.5:
             shown_first, shown_second = proposal.left_id, proposal.right_id
         else:
             shown_first, shown_second = proposal.right_id, proposal.left_id
+        diagnostics = dict(proposal.diagnostics)
+        if source_purpose_key is not None:
+            diagnostics[source_purpose_key] = proposal.purpose
         scheduled.append(
             ScheduledPair(
                 left_id=proposal.left_id,
                 right_id=proposal.right_id,
-                priority=round(proposal.score, 8),
-                purpose=proposal.purpose,
+                priority=(
+                    round(priority_override, 8)
+                    if priority_override is not None
+                    else round(proposal.score, 8)
+                ),
+                purpose=purpose_override or proposal.purpose,
                 order=PairwiseOrderMetadata(
                     shown_first_id=shown_first,
                     shown_second_id=shown_second,
@@ -425,10 +881,59 @@ def _select_evsi_pairs(
                         "canonical_right_id": proposal.right_id,
                     },
                 ),
-                diagnostics=proposal.diagnostics,
+                diagnostics=diagnostics,
             )
         )
     return scheduled
+
+
+def _annotate_batch_pair(
+    pair: ScheduledPair,
+    *,
+    batch_index: int,
+    global_index: int,
+) -> ScheduledPair:
+    order_extra = dict(pair.order.extra)
+    order_extra["sequential_batch_index"] = batch_index
+    diagnostics = dict(pair.diagnostics)
+    diagnostics["sequential_batch_index"] = batch_index
+    return ScheduledPair(
+        left_id=pair.left_id,
+        right_id=pair.right_id,
+        priority=pair.priority,
+        purpose=pair.purpose,
+        order=PairwiseOrderMetadata(
+            shown_first_id=pair.order.shown_first_id,
+            shown_second_id=pair.order.shown_second_id,
+            randomized=pair.order.randomized,
+            seed=pair.order.seed,
+            position_bias_audit=(global_index % 5 == 0),
+            extra=order_extra,
+        ),
+        diagnostics=diagnostics,
+    )
+
+
+def _orient_revealed_comparison(
+    comparison: PairwiseComparison,
+    pair: ScheduledPair,
+) -> PairwiseComparison:
+    if comparison.left_id == pair.left_id and comparison.right_id == pair.right_id:
+        winner = comparison.winner
+    elif comparison.left_id == pair.right_id and comparison.right_id == pair.left_id:
+        winner = _invert_winner(comparison.winner)
+    else:
+        raise ValueError("revealed comparison does not reference selected pair")
+    return PairwiseComparison(
+        left_id=pair.left_id,
+        right_id=pair.right_id,
+        winner=winner,
+        soft_probability=comparison.soft_probability,
+        confidence=comparison.confidence,
+        reasons=list(comparison.reasons),
+        order=pair.order,
+        metadata=dict(comparison.metadata),
+    )
 
 
 def _evsi_coverage(
@@ -475,7 +980,109 @@ def _evsi_coverage(
     }
 
 
-def _empty_schedule_diagnostics(*, k: int, budget: int) -> dict[str, Any]:
+def _proposal_pool_profile(
+    *,
+    items: list[_PosteriorItem],
+    pool: list[_PosteriorItem],
+    scheduled: list[ScheduledPair],
+    k: int,
+) -> dict[str, Any]:
+    touched = {
+        paper_id
+        for pair in scheduled
+        for paper_id in (pair.left_id, pair.right_id)
+    }
+    by_top_k = sorted(
+        items,
+        key=lambda item: (item.top_k_probability, item.mean, item.paper_id),
+        reverse=True,
+    )
+    plausible = by_top_k[: max(1, min(len(by_top_k), 2 * max(k, 1)))]
+    top_k_ids = {item.paper_id for item in by_top_k[: max(k, 1)]}
+    high_ucb_outsiders = [
+        item
+        for item in sorted(
+            items,
+            key=lambda item: (item.ucb, item.top_k_probability, item.paper_id),
+            reverse=True,
+        )
+        if item.paper_id not in top_k_ids
+    ][: max(k, 1)]
+    exposed_high_ucb = [
+        item.paper_id for item in high_ucb_outsiders if item.paper_id in touched
+    ]
+    plausible_touched = [
+        item.paper_id for item in plausible if item.paper_id in touched
+    ]
+    return {
+        "pool_item_count": len(pool),
+        "plausible_top_k_total": len(plausible),
+        "plausible_top_k_touched": len(plausible_touched),
+        "plausible_top_k_touch_rate": _rate(len(plausible_touched), len(plausible)),
+        "high_ucb_outsider_total": len(high_ucb_outsiders),
+        "high_ucb_outsider_touched": len(exposed_high_ucb),
+        "high_ucb_outsider_exposure_rate": _rate(
+            len(exposed_high_ucb),
+            len(high_ucb_outsiders),
+        ),
+        "scheduled_unique_papers": len(touched),
+    }
+
+
+def _evsi_score_distribution(proposals: list[_AcquisitionProposal]) -> dict[str, Any]:
+    total = len(proposals)
+    if total == 0:
+        return {
+            "proposal_count": 0,
+            "zero_score_total": 0,
+            "zero_score_rate": 0.0,
+            "tied_score_total": 0,
+            "tied_score_rate": 0.0,
+        }
+    zero_total = sum(1 for proposal in proposals if proposal.score <= 1e-12)
+    rounded_scores = Counter(round(proposal.score, 12) for proposal in proposals)
+    tied_total = sum(count for count in rounded_scores.values() if count > 1)
+    return {
+        "proposal_count": total,
+        "zero_score_total": zero_total,
+        "zero_score_rate": _rate(zero_total, total),
+        "tied_score_total": tied_total,
+        "tied_score_rate": _rate(tied_total, total),
+    }
+
+
+def _posterior_top_k_entropy(posterior: TopKPosterior) -> float:
+    return round(
+        sum(_binary_entropy(probability) for probability in posterior.top_k_probabilities.values()),
+        8,
+    )
+
+
+def _posterior_top_k_set(posterior: TopKPosterior, *, k: int) -> set[str]:
+    ranked = sorted(
+        posterior.top_k_probabilities.items(),
+        key=lambda item: (item[1], item[0]),
+        reverse=True,
+    )
+    return {paper_id for paper_id, _ in ranked[: max(k, 0)]}
+
+
+def _top_k_set_churn(before: set[str], after: set[str]) -> float:
+    if not before and not after:
+        return 0.0
+    return _rate(len(before.symmetric_difference(after)), len(before | after))
+
+
+def _rate(numerator: int, denominator: int) -> float:
+    return round(numerator / denominator, 8) if denominator else 0.0
+
+
+def _empty_schedule_diagnostics(
+    *,
+    k: int,
+    budget: int,
+    method: str,
+) -> dict[str, Any]:
     return {
         "candidate_count": 0,
         "scheduled_total": 0,
@@ -483,7 +1090,7 @@ def _empty_schedule_diagnostics(*, k: int, budget: int) -> dict[str, Any]:
         "unique_pairs_considered": 0,
         "budget": budget,
         "k": k,
-        "acquisition": {"method": "top_k_evsi_approximation"},
+        "acquisition": {"method": method},
         "purpose_counts": {},
         "coverage": {
             "purpose_counts": {},
@@ -491,6 +1098,17 @@ def _empty_schedule_diagnostics(*, k: int, budget: int) -> dict[str, Any]:
             "incumbent_challenger_pairs": 0,
             "metadata_cross_bucket_pairs": 0,
         },
+        "proposal_pool_profile": {
+            "pool_item_count": 0,
+            "plausible_top_k_total": 0,
+            "plausible_top_k_touched": 0,
+            "plausible_top_k_touch_rate": 0.0,
+            "high_ucb_outsider_total": 0,
+            "high_ucb_outsider_touched": 0,
+            "high_ucb_outsider_exposure_rate": 0.0,
+            "scheduled_unique_papers": 0,
+        },
+        "evsi_score_distribution": _evsi_score_distribution([]),
     }
 
 
@@ -555,3 +1173,11 @@ def _sigmoid(value: float) -> float:
         return 1.0 / (1.0 + scale)
     scale = math.exp(value)
     return scale / (1.0 + scale)
+
+
+def _invert_winner(winner: str) -> str:
+    if winner == "left":
+        return "right"
+    if winner == "right":
+        return "left"
+    return winner

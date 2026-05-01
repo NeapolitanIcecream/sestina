@@ -42,8 +42,11 @@ from sestina.candidates import CandidateSelection, select_candidates
 from sestina.diagnostics import DiagnosticRecorder, fingerprint, write_json_artifact
 from sestina.evsi_scheduler import (
     EVSISchedulerConfig,
+    SequentialEVSISchedulerConfig,
     posterior_top_k_predictions,
+    schedule_cache_aware_sequential_evsi,
     schedule_evsi_boundary_duels,
+    schedule_exact_pool_random,
 )
 from sestina.models import (
     PairwiseComparison,
@@ -82,6 +85,7 @@ class SchedulerOnlyBucketPlan:
     diagnostics: dict[str, Any]
     reusable_pairwise: dict[tuple[str, str], ReusablePairwiseArtifact]
     reusable_stats: dict[str, Any]
+    reveal_log: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def novel_pairs(self) -> list[ScheduledPair]:
@@ -170,6 +174,11 @@ class SchedulerOnlyRunner:
             "scheduler_kind": self.scheduler_kind,
             "aggregation_mode": self.aggregation_mode,
             "estimated_spend_usd": totals["cost_usd"],
+            "paid_call_status": (
+                "not_requested_no_paid_calls_made"
+                if not self.confirm_paid
+                else "requested_after_safety_checks"
+            ),
             "model_availability": {"status": "not_checked_dry_run"},
             "bucket_results": [],
             "reuse_policy": (
@@ -179,12 +188,35 @@ class SchedulerOnlyRunner:
         }
         summary.update(totals)
         summary.update(_ledger_stats(ledger))
+        blocker = _scheduler_only_blocker_payload(
+            scheduler_kind=self.scheduler_kind,
+            plans=plans,
+            call_estimate=estimate,
+        )
+        if blocker:
+            summary["blocker"] = blocker
 
         if not self.confirm_paid:
+            offline_payload = _offline_bucket_results_payload(
+                plans,
+                phase=self.phase,
+                aggregation_mode=self.aggregation_mode,
+                artifact_path=self.artifact_dir / f"offline-bucket-results-{self.phase}.json",
+            )
+            offline_path = self.artifact_dir / f"offline-bucket-results-{self.phase}.json"
+            write_json_artifact(offline_path, offline_payload)
+            summary["offline_bucket_results_path"] = str(offline_path)
+            summary["offline_bucket_results"] = offline_payload["bucket_results"]
             summary_path = self.artifact_dir / f"summary-{self.phase}.json"
             write_json_artifact(summary_path, summary)
             return {**summary, "summary_path": str(summary_path)}
 
+        if self.scheduler_kind == "sequential_evsi" and totals["pairwise_novel_total"]:
+            raise PaidRunSafetyError(
+                "sequential_evsi paid execution is blocked because the dry-run "
+                "encountered novel pairs whose labels are needed before later "
+                "batches can be selected"
+            )
         _validate_scheduler_only_paid_preconditions(
             max_usd=self.max_usd,
             estimate_usd=float(totals["cost_usd"]),
@@ -461,6 +493,9 @@ def build_scheduler_only_bucket_plan(
         candidate_size=len(selection.candidate_ids),
         diagnostics=diagnostics,
     )
+    reveal_log: list[dict[str, Any]] = []
+    reusable: dict[tuple[str, str], ReusablePairwiseArtifact] = {}
+    reusable_stats: dict[str, Any] = {}
     if scheduler_kind == "quota":
         schedule = schedule_pairs(
             papers,
@@ -480,15 +515,74 @@ def build_scheduler_only_bucket_plan(
             diagnostics=diagnostics,
             config=EVSISchedulerConfig(samples=1200),
         )
+    elif scheduler_kind == "exact_pool_random":
+        schedule = schedule_exact_pool_random(
+            papers,
+            [],
+            k=bucket.k,
+            budget=budget,
+            seed=seed,
+            diagnostics=diagnostics,
+            config=EVSISchedulerConfig(samples=1200),
+        )
+    elif scheduler_kind == "sequential_evsi":
+        reusable, reusable_stats = load_historical_pairwise_reuse_cache(
+            bucket,
+            papers=papers,
+            source_artifact_dir=source_artifact_dir,
+            phase=phase,
+            seed=seed,
+        )
+
+        def reveal_cached(pair: ScheduledPair) -> PairwiseComparison | None:
+            pair_key = canonical_pair_key(pair.left_id, pair.right_id)
+            reusable_artifact = reusable.get(pair_key)
+            if reusable_artifact is None:
+                reveal_log.append(
+                    {
+                        "pair_key": list(pair_key),
+                        "status": "novel",
+                        "revealed": False,
+                    }
+                )
+                return None
+            comparison = orient_comparison(reusable_artifact.comparison, pair)
+            reveal_log.append(
+                {
+                    "pair_key": list(pair_key),
+                    "status": "cached",
+                    "revealed": True,
+                    "source_kind": reusable_artifact.kind,
+                    "source_artifact_path": str(reusable_artifact.artifact_path),
+                }
+            )
+            return comparison
+
+        schedule = schedule_cache_aware_sequential_evsi(
+            papers,
+            [],
+            reveal_comparison=reveal_cached,
+            k=bucket.k,
+            budget=budget,
+            seed=seed,
+            diagnostics=diagnostics,
+            config=SequentialEVSISchedulerConfig(
+                evsi=EVSISchedulerConfig(samples=1200),
+                rounds=5,
+                batch_size=4,
+                stop_on_novel=True,
+            ),
+        )
     else:
         raise ValueError(f"unknown scheduler_kind {scheduler_kind!r}")
-    reusable, reusable_stats = load_historical_pairwise_reuse_cache(
-        bucket,
-        papers=papers,
-        source_artifact_dir=source_artifact_dir,
-        phase=phase,
-        seed=seed,
-    )
+    if not reusable_stats:
+        reusable, reusable_stats = load_historical_pairwise_reuse_cache(
+            bucket,
+            papers=papers,
+            source_artifact_dir=source_artifact_dir,
+            phase=phase,
+            seed=seed,
+        )
     schedule_keys = {
         canonical_pair_key(pair.left_id, pair.right_id) for pair in schedule.pairs
     }
@@ -502,16 +596,27 @@ def build_scheduler_only_bucket_plan(
             1 for key in schedule_keys if key not in reusable
         ),
     }
+    merged_diagnostics = _merged_schedule_diagnostics(
+        schedule.diagnostics,
+        diagnostics.to_dict(),
+    )
+    merged_diagnostics["isolation"] = _scheduler_isolation_diagnostics(
+        bucket,
+        papers=papers,
+        schedule=schedule.pairs,
+        reusable_pairwise=reusable,
+        scheduler_diagnostics=schedule.diagnostics,
+    )
+    if reveal_log:
+        merged_diagnostics["cache_reveal_log"] = reveal_log
     return SchedulerOnlyBucketPlan(
         bucket=bucket,
         papers=papers,
         schedule=schedule.pairs,
-        diagnostics=_merged_schedule_diagnostics(
-            schedule.diagnostics,
-            diagnostics.to_dict(),
-        ),
+        diagnostics=merged_diagnostics,
         reusable_pairwise=reusable,
         reusable_stats=reusable_stats,
+        reveal_log=reveal_log,
     )
 
 
@@ -1057,6 +1162,80 @@ def _scheduler_only_estimate_payload(
     }
 
 
+def _scheduler_only_blocker_payload(
+    *,
+    scheduler_kind: str,
+    plans: list[SchedulerOnlyBucketPlan],
+    call_estimate: CallEstimate,
+) -> dict[str, Any] | None:
+    novel_total = sum(
+        plan.reusable_stats["scheduled_novel_total"] for plan in plans
+    )
+    if novel_total <= 0:
+        return None
+    return {
+        "status": "blocked_on_paid_pairwise_labels",
+        "scheduler_kind": scheduler_kind,
+        "novel_pairwise_calls_required_minimum": int(novel_total),
+        "estimated_input_tokens": int(novel_total * call_estimate.input_tokens),
+        "estimated_output_tokens": int(novel_total * call_estimate.output_tokens),
+        "estimated_cost_usd": round(novel_total * call_estimate.cost_usd, 6),
+        "paid_call_policy": (
+            "dry-run records novel pairs but does not pretend labels are known"
+        ),
+        "recommended_action": (
+            "review the dry-run novel pairs and run a guarded paid labeling pass "
+            "only after supervisor approval"
+        ),
+    }
+
+
+def _offline_bucket_results_payload(
+    plans: list[SchedulerOnlyBucketPlan],
+    *,
+    phase: str,
+    aggregation_mode: str,
+    artifact_path: Path,
+) -> dict[str, Any]:
+    bucket_results = []
+    for plan in plans:
+        comparisons = _cached_schedule_comparisons(plan)
+        result = _bucket_metrics_payload(
+            plan,
+            comparisons=comparisons,
+            artifact_path=artifact_path,
+            aggregation_mode=aggregation_mode,
+        )
+        missing = len(plan.schedule) - len(comparisons)
+        result["offline_label_status"] = {
+            "scheduled_pairwise_total": len(plan.schedule),
+            "cached_pairwise_labels_available": len(comparisons),
+            "missing_pairwise_labels": missing,
+            "partial": missing > 0,
+        }
+        bucket_results.append(result)
+    return {
+        "artifact_type": "sestina-scheduler-only-offline-bucket-results",
+        "phase": phase,
+        "aggregation_mode": aggregation_mode,
+        "bucket_results": bucket_results,
+    }
+
+
+def _cached_schedule_comparisons(
+    plan: SchedulerOnlyBucketPlan,
+) -> list[PairwiseComparison]:
+    comparisons = []
+    for pair in plan.schedule:
+        reusable = plan.reusable_pairwise.get(
+            canonical_pair_key(pair.left_id, pair.right_id)
+        )
+        if reusable is None:
+            continue
+        comparisons.append(orient_comparison(reusable.comparison, pair))
+    return comparisons
+
+
 def _bucket_metrics_payload(
     plan: SchedulerOnlyBucketPlan,
     *,
@@ -1406,6 +1585,214 @@ def _historical_schedule_coverage(
 
 def _purpose_counts(schedule: list[ScheduledPair]) -> dict[str, int]:
     return dict(sorted(Counter(pair.purpose for pair in schedule).items()))
+
+
+def _scheduler_isolation_diagnostics(
+    bucket: BacktestBucket,
+    *,
+    papers: list[Paper],
+    schedule: list[ScheduledPair],
+    reusable_pairwise: dict[tuple[str, str], ReusablePairwiseArtifact],
+    scheduler_diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    touched = {
+        paper_id
+        for pair in schedule
+        for paper_id in (pair.left_id, pair.right_id)
+    }
+    degrees = Counter(
+        paper_id
+        for pair in schedule
+        for paper_id in (pair.left_id, pair.right_id)
+    )
+    ranked = sorted(
+        papers,
+        key=lambda paper: (
+            paper.pointwise.good_probability,
+            -paper.pointwise.uncertainty,
+            paper.paper_id,
+        ),
+        reverse=True,
+    )
+    plausible_ids = [
+        paper.paper_id for paper in ranked[: max(1, min(len(ranked), 2 * bucket.k))]
+    ]
+    anchor_ids = [paper.paper_id for paper in ranked[: max(bucket.k, 0)]]
+    components = _schedule_components(schedule)
+    component_by_id = {
+        paper_id: index
+        for index, component in enumerate(components)
+        for paper_id in component
+    }
+    anchor_component_ids = {
+        component_by_id[paper_id]
+        for paper_id in anchor_ids
+        if paper_id in component_by_id
+    }
+    pool_profile = scheduler_diagnostics.get("proposal_pool_profile") or {}
+    return {
+        "unique_papers_touched": len(touched),
+        "unique_papers_touched_rate": _safe_rate(len(touched), len(papers)),
+        "plausible_top_k_papers": len(plausible_ids),
+        "plausible_top_k_papers_touched": sum(
+            1 for paper_id in plausible_ids if paper_id in touched
+        ),
+        "plausible_top_k_degree_distribution": _degree_distribution(
+            [degrees[paper_id] for paper_id in plausible_ids]
+        ),
+        "connected_components": {
+            "component_count": len(components),
+            "largest_component_size": max((len(component) for component in components), default=0),
+            "anchor_papers": len(anchor_ids),
+            "anchor_papers_touched": sum(
+                1 for paper_id in anchor_ids if paper_id in touched
+            ),
+            "components_with_anchor": len(anchor_component_ids),
+        },
+        "high_ucb_outsider_exposure": {
+            "high_ucb_outsider_total": int(
+                pool_profile.get("high_ucb_outsider_total") or 0
+            ),
+            "high_ucb_outsider_touched": int(
+                pool_profile.get("high_ucb_outsider_touched") or 0
+            ),
+            "high_ucb_outsider_exposure_rate": float(
+                pool_profile.get("high_ucb_outsider_exposure_rate") or 0.0
+            ),
+        },
+        "per_batch_top_k": scheduler_diagnostics.get("batch_history", []),
+        "evsi_score_distribution": scheduler_diagnostics.get(
+            "evsi_score_distribution",
+            {},
+        ),
+        "retrospective_future_positive_exposure": (
+            _future_positive_exposure(schedule, relevant_ids=bucket.relevant_ids)
+        ),
+        "positive_vs_negative_pairwise_win_rate": (
+            _positive_negative_win_rate(
+                schedule,
+                relevant_ids=bucket.relevant_ids,
+                reusable_pairwise=reusable_pairwise,
+            )
+        ),
+    }
+
+
+def _schedule_components(schedule: list[ScheduledPair]) -> list[set[str]]:
+    graph: dict[str, set[str]] = {}
+    for pair in schedule:
+        graph.setdefault(pair.left_id, set()).add(pair.right_id)
+        graph.setdefault(pair.right_id, set()).add(pair.left_id)
+    components: list[set[str]] = []
+    seen: set[str] = set()
+    for paper_id in sorted(graph):
+        if paper_id in seen:
+            continue
+        stack = [paper_id]
+        component: set[str] = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            component.add(current)
+            stack.extend(sorted(graph.get(current, set()) - seen))
+        components.append(component)
+    return components
+
+
+def _degree_distribution(values: list[int]) -> dict[str, float | int]:
+    if not values:
+        return {
+            "count": 0,
+            "min": 0,
+            "max": 0,
+            "mean": 0.0,
+            "zero_degree_count": 0,
+        }
+    return {
+        "count": len(values),
+        "min": min(values),
+        "max": max(values),
+        "mean": round(sum(values) / len(values), 8),
+        "zero_degree_count": sum(1 for value in values if value == 0),
+    }
+
+
+def _future_positive_exposure(
+    schedule: list[ScheduledPair],
+    *,
+    relevant_ids: set[str],
+) -> dict[str, Any]:
+    if not schedule:
+        return {
+            "scheduled_pairs_total": 0,
+            "pairs_touching_future_positive": 0,
+            "pair_exposure_rate": 0.0,
+            "unique_future_positives_touched": 0,
+        }
+    positive_pairs = 0
+    positives_touched: set[str] = set()
+    for pair in schedule:
+        pair_ids = {pair.left_id, pair.right_id}
+        exposed = pair_ids & relevant_ids
+        if exposed:
+            positive_pairs += 1
+            positives_touched.update(exposed)
+    return {
+        "scheduled_pairs_total": len(schedule),
+        "pairs_touching_future_positive": positive_pairs,
+        "pair_exposure_rate": _safe_rate(positive_pairs, len(schedule)),
+        "unique_future_positives_touched": len(positives_touched),
+        "unique_future_positive_touch_rate": _safe_rate(
+            len(positives_touched),
+            len(relevant_ids),
+        ),
+    }
+
+
+def _positive_negative_win_rate(
+    schedule: list[ScheduledPair],
+    *,
+    relevant_ids: set[str],
+    reusable_pairwise: dict[tuple[str, str], ReusablePairwiseArtifact],
+) -> dict[str, Any]:
+    eligible = 0
+    positive_wins = 0
+    negative_wins = 0
+    ties_or_uncertain = 0
+    pairwise_labels_available = 0
+    for pair in schedule:
+        reusable = reusable_pairwise.get(canonical_pair_key(pair.left_id, pair.right_id))
+        if reusable is None:
+            continue
+        pairwise_labels_available += 1
+        left_positive = pair.left_id in relevant_ids
+        right_positive = pair.right_id in relevant_ids
+        if left_positive == right_positive:
+            continue
+        eligible += 1
+        comparison = orient_comparison(reusable.comparison, pair)
+        if comparison.winner == "tie" or comparison.winner == "uncertain":
+            ties_or_uncertain += 1
+        elif (comparison.winner == "left" and left_positive) or (
+            comparison.winner == "right" and right_positive
+        ):
+            positive_wins += 1
+        else:
+            negative_wins += 1
+    return {
+        "pairwise_labels_available": pairwise_labels_available,
+        "positive_negative_pairs_with_label": eligible,
+        "positive_wins": positive_wins,
+        "negative_wins": negative_wins,
+        "ties_or_uncertain": ties_or_uncertain,
+        "positive_win_rate": _safe_rate(positive_wins, eligible),
+    }
+
+
+def _safe_rate(numerator: int, denominator: int) -> float:
+    return round(numerator / denominator, 8) if denominator else 0.0
 
 
 def _schedule_diagnostics_coverage(diagnostics: dict[str, Any]) -> dict[str, Any]:

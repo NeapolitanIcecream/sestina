@@ -74,7 +74,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument(
         "--scheduler-kind",
-        choices=["quota", "evsi"],
+        choices=["quota", "evsi", "exact_pool_random", "sequential_evsi"],
         default="quota",
         help="active pair scheduler to use for the follow-up",
     )

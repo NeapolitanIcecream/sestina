@@ -260,6 +260,34 @@ def test_scheduler_only_evsi_mode_can_report_posterior_topk_metrics(
     )
 
 
+def test_scheduler_only_exact_pool_random_mode_reports_pool_diagnostics(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_config(tmp_path)
+    manifest_path = _write_manifest(tmp_path)
+    source_dir = tmp_path / "source"
+    _write_pointwise_artifacts(source_dir)
+
+    summary = SchedulerOnlyRunner(
+        config_path=config_path,
+        manifest_path=manifest_path,
+        source_artifact_dir=source_dir,
+        artifact_dir=tmp_path / "dry",
+        ledger_path=tmp_path / "dry" / "ledger.jsonl",
+        max_usd=0.50,
+        scheduler_kind="exact_pool_random",
+        aggregation_mode="posterior_topk",
+    ).run()
+
+    estimate = json.loads(Path(summary["estimate_path"]).read_text())
+    diagnostics = estimate["buckets"][0]["scheduler_diagnostics"]
+    assert summary["scheduler_kind"] == "exact_pool_random"
+    assert diagnostics["acquisition"]["method"] == "exact_pool_random"
+    assert diagnostics["acquisition"]["source_method"] == "top_k_evsi_approximation"
+    assert "isolation" in diagnostics
+    assert "offline_bucket_results_path" in summary
+
+
 def _write_config(tmp_path: Path) -> Path:
     path = tmp_path / "config.json"
     path.write_text(

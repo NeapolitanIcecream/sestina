@@ -217,6 +217,69 @@ Interpretation:
   outsider challengers or to use earlier pairwise outcomes adaptively within
   each bucket.
 
+## Sequential EVSI Isolation Dry-Run
+
+Implemented the minimal isolation experiment for the acquisition-policy
+diagnosis:
+
+- A: keep the existing historical random pairwise + posterior top-K baseline
+  fixed at Recall@K 0.375, nDCG@K 0.412096, AP 0.407579.
+- B: add `--scheduler-kind exact_pool_random`, which builds the same feasible
+  EVSI proposal pool as the EVSI scheduler and samples randomly from that pool.
+- C: add `--scheduler-kind sequential_evsi`, which uses 5 rounds x 4 pairs per
+  bucket, refits the posterior before each batch, selects the batch, and only
+  then reveals cached historical labels. Novel uncached pairs stop the dry-run
+  path rather than being treated as known.
+
+New scheduler diagnostics are machine-readable in the follow-up estimate,
+summary, and offline bucket-result artifacts. They include unique papers
+touched, plausible top-K degree distribution, connected component and anchor
+coverage, high-UCB outsider exposure, per-batch top-K entropy/churn, EVSI
+zero/tie score rates, retrospective future-positive exposure, and
+positive-vs-negative pairwise win rate when pairwise labels are available.
+
+Dry-run commands, both with no paid calls:
+
+```bash
+uv run python scripts/run_scheduler_followup.py \
+  --max-usd 0.50 \
+  --artifact-dir artifacts/backtest-arxiv-exact-pool-random-dry-run \
+  --ledger artifacts/backtest-arxiv-exact-pool-random-dry-run/ledger.jsonl \
+  --scheduler-kind exact_pool_random \
+  --aggregation-mode posterior_topk \
+  --seed 17
+
+uv run python scripts/run_scheduler_followup.py \
+  --max-usd 0.50 \
+  --artifact-dir artifacts/backtest-arxiv-sequential-evsi-dry-run \
+  --ledger artifacts/backtest-arxiv-sequential-evsi-dry-run/ledger.jsonl \
+  --scheduler-kind sequential_evsi \
+  --aggregation-mode posterior_topk \
+  --seed 17
+```
+
+Dry-run results:
+
+| Arm | Scheduled pairs | Cached labels | Novel labels | Estimated cost | Status |
+|---|---:|---:|---:|---:|---|
+| Exact-pool random | 160 | 27 | 133 | USD 0.097755 | Blocked for valid full metrics |
+| Sequential EVSI | 32 | 11 | 21 | USD 0.015435 | Blocked after first novel batch per bucket |
+
+Partial offline metrics were computed only from cached labels and are not valid
+full-arm results:
+
+| Arm | Aggregation | Recall@K | nDCG@K | AP |
+|---|---|---:|---:|---:|
+| Exact-pool random partial | Score | 0.325 | 0.360457 | 0.376952 |
+| Exact-pool random partial | Posterior top-K | 0.300 | 0.335894 | 0.364423 |
+| Sequential EVSI partial | Score | 0.300 | 0.336648 | 0.351298 |
+| Sequential EVSI partial | Posterior top-K | 0.300 | 0.341445 | 0.363506 |
+
+Blocker: a valid exact-pool random result needs 133 new pairwise labels under the
+current cache and seed. A valid sequential EVSI continuation needs at least the
+21 first-blocking novel labels, then the sequential dry-run must be rerun because
+later batches depend on those revealed outcomes. No paid calls were made.
+
 ## Conclusion
 
 The pointwise-first and pairwise-light design is worth keeping. The evidence is
