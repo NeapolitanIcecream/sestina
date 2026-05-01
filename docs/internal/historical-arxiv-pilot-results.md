@@ -48,9 +48,10 @@ Known paid spend:
 | Posterior top-K EVSI follow-up | USD 0.063945 |
 | Exact-pool random isolation | USD 0.098490 |
 | Sequential EVSI isolation | USD 0.063945 |
-| Total known paid spend | USD 1.171660 |
+| CCTD-GF isolation | USD 0.083790 |
+| Total known paid spend | USD 1.255450 |
 
-Remaining from the USD 100 cap: USD 98.828340.
+Remaining from the USD 100 cap: USD 98.744550.
 
 All paid phases used explicit dry-run estimates, provider-prefixed model names,
 model availability checks, JSONL ledgers, artifact directories, and hard
@@ -355,14 +356,97 @@ still matter because exact-pool random trails the historical random posterior
 top-K nDCG/AP, but stale one-shot scoring is no longer a compelling primary
 explanation.
 
-Do not start a larger main run until the active scheduler has a changed
-acquisition objective and a better small-scale result against exact-pool random
-and historical random pairwise.
+## CCTD-GF Isolation Results
+
+Implemented `--scheduler-kind cctd_gf`: Coverage-Constrained Thompson Top-K
+Disagreement with Graph Floor.
+
+The scheduler keeps the EVSI/exact-pool feasible proposal pool and posterior
+top-K aggregation, but changes acquisition inside the pool:
+
+- 4 adaptive mini-batches x 5 pairs per bucket.
+- Per bucket target mix: 12 sampled top-K disagreement pairs, 4 graph-floor
+  anchor pairs, and 4 exact-pool random floor pairs.
+- Posterior latent samples estimate top-K disagreement and BALD-style pair
+  information.
+- Graph diagnostics track active degrees, cross-component pairs, decision
+  boundary pairs, top-K disagreement, information, and score/probability gaps.
+- The guarded follow-up runner stops after any batch with novel labels, pays
+  only through `scripts/run_scheduler_followup.py`, and resumes after those
+  labels become cache-revealable.
+
+Dry-run plan for the first adaptive pass:
+
+- 40 scheduled pairs.
+- 16 historical/follow-up labels reusable.
+- 24 novel pairwise labels.
+- Estimated spend: USD 0.017640.
+
+Live CCTD-GF:
+
+- Artifact directory: `artifacts/backtest-arxiv-cctd-gf-live`.
+- Summary: `artifacts/backtest-arxiv-cctd-gf-live/summary-pilot.json`.
+- Ledger: `artifacts/backtest-arxiv-cctd-gf-live/ledger.jsonl`.
+- Noise audit: `artifacts/backtest-arxiv-cctd-gf-live/pairwise-noise-audit.json`.
+- 160 scheduled pairs, 20 per bucket.
+- 46 historical/follow-up pairwise labels reused.
+- 114 successful paid pairwise labels.
+- Spend: USD 0.083790.
+- Completion status: `complete`.
+
+Full CCTD-GF metrics:
+
+| Arm | Aggregation | Recall@K | Precision@K | nDCG@K | AP | Brier |
+|---|---|---:|---:|---:|---:|---:|
+| CCTD-GF | Score | 0.325 | 0.325 | 0.368947 | 0.382628 | 0.701625 |
+| CCTD-GF | Posterior top-K | 0.325 | 0.325 | 0.367089 | 0.375631 | 0.054283 |
+| Exact-pool random reference | Posterior top-K | 0.375 | 0.375 | 0.404687 | 0.381836 | 0.054963 |
+| Historical random reference | Posterior top-K | 0.375 | 0.375 | 0.412096 | 0.407579 | 0.053854 |
+
+Interpretation:
+
+- CCTD-GF did not beat exact-pool random on Recall@K or nDCG@K.
+- CCTD-GF posterior top-K AP also fell below exact-pool random.
+- The graph floor did not fix the active-acquisition failure. In this pilot,
+  concentrating on sampled disagreement plus graph anchors still chose a worse
+  set of comparisons than random sampling from the same feasible pool.
+- Do not start a larger CCTD-GF main run.
+
+Offline noise audit:
+
+- The audit is best-effort and citation-retrospective. It uses future citation
+  labels only after the fact and does not change the model-visible data.
+- Citation alignment is available for completed pairwise artifacts. Boundary,
+  information, and score/probability-gap stratification is limited because
+  older historical artifacts do not store `scheduled_pair` diagnostics and some
+  reused labels lack CCTD-GF diagnostics.
+- CCTD-GF pairwise judgments were not obviously less citation-aligned than
+  random controls: the judge winner had higher future citations on 75/157
+  comparable CCTD-GF pairs, or 0.477707, versus 53/156, or 0.339744, for
+  exact-pool random.
+- Future positives beat nonpositives on 30/62 CCTD-GF positive-vs-nonpositive
+  pairs, or 0.483871, versus 16/44, or 0.363636, for exact-pool random.
+- EVSI-selected boundary pairs did not appear less citation-aligned than
+  random/exact-pool pairs in this audit. The EVSI-boundary citation-alignment
+  rate was 0.418502 versus 0.359736 for random/exact-pool; however, many older
+  EVSI/random artifacts lack scheduler diagnostics, so this is not a clean
+  causal diagnosis.
+- The audit therefore does not support pairwise-label noise as the main
+  explanation for CCTD-GF underperformance. The stronger explanation remains
+  that the acquisition policy is surfacing citation-aligned comparisons that do
+  not move the posterior top-K decision in the right buckets.
+
+## Recommendation
+
+Use random or exact-pool random plus posterior top-K as the default small-run
+baseline. Do not start a larger main run for CCTD-GF. The next active arm should
+change either candidate construction or the posterior decision model, not only
+the within-pool acquisition score.
 
 ## Current Next Question
 
-The next external algorithmic question should include the posterior top-K EVSI
-result, not just the quota scheduler result. A compact prompt is:
+The next external algorithmic question should include the posterior top-K EVSI,
+exact-pool random, sequential EVSI, and CCTD-GF results. A compact prompt is:
 
 ```text
 We are building Sestina, a pointwise-first, pairwise-light system for finding
@@ -406,8 +490,20 @@ pool. Adaptivity alone did not fix the failure, so stale one-shot scoring is
 not the primary blocker. Pool/graph quality remains a secondary concern because
 exact-pool random still trails historical random on nDCG/AP.
 
+We then implemented CCTD-GF: 4 adaptive mini-batches x 5 pairs per bucket, with
+12 sampled top-K disagreement pairs, 4 graph-floor anchor pairs, and 4 exact-pool
+random floor pairs per bucket. It scheduled 160 pairs, reused 46 labels, made
+114 successful paid pairwise calls, and cost USD 0.083790. CCTD-GF with
+posterior top-K reached Recall@K 0.325, nDCG@K 0.3671, AP 0.3756. It did not
+beat exact-pool random. A best-effort offline noise audit did not show CCTD-GF
+or EVSI-boundary labels were less citation-aligned than random/exact-pool
+labels, but many older artifacts lack scheduler diagnostics.
+
 What algorithmic change should we try next? Focus on active pair selection,
 candidate construction, aggregation/posterior modeling, or a different
 evaluation design. We want a low-pairwise-budget method that can beat random
-pairwise without relying on full ranking.
+pairwise without relying on full ranking. Given CCTD-GF also failed, random or
+exact-pool random plus posterior top-K should remain the default small-run
+baseline until the next active arm changes candidate construction or the
+posterior decision model.
 ```

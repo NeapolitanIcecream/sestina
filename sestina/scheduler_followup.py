@@ -41,9 +41,11 @@ from sestina.backtest_runner import (
 from sestina.candidates import CandidateSelection, select_candidates
 from sestina.diagnostics import DiagnosticRecorder, fingerprint, write_json_artifact
 from sestina.evsi_scheduler import (
+    CCTDGFSchedulerConfig,
     EVSISchedulerConfig,
     SequentialEVSISchedulerConfig,
     posterior_top_k_predictions,
+    schedule_cache_aware_cctd_gf,
     schedule_cache_aware_sequential_evsi,
     schedule_evsi_boundary_duels,
     schedule_exact_pool_random,
@@ -105,7 +107,7 @@ class SchedulerOnlyRunner:
     artifact_dir: Path
     ledger_path: Path
     phase: str = "pilot"
-    max_usd: float = 0.50
+    max_usd: float = 2.00
     confirm_paid: bool = False
     seed: int = 17
     scheduler_kind: str = "quota"
@@ -202,6 +204,12 @@ class SchedulerOnlyRunner:
         )
         if sequential_completion is not None:
             summary["sequential_evsi_completion"] = sequential_completion
+        cctd_gf_completion = _cctd_gf_completion_payload(
+            scheduler_kind=self.scheduler_kind,
+            plans=plans,
+        )
+        if cctd_gf_completion is not None:
+            summary["cctd_gf_completion"] = cctd_gf_completion
 
         if not self.confirm_paid:
             offline_payload = _offline_bucket_results_payload(
@@ -529,7 +537,7 @@ def build_scheduler_only_bucket_plan(
             diagnostics=diagnostics,
             config=EVSISchedulerConfig(samples=1200),
         )
-    elif scheduler_kind == "sequential_evsi":
+    elif scheduler_kind in {"sequential_evsi", "cctd_gf"}:
         reusable, reusable_stats = load_historical_pairwise_reuse_cache(
             bucket,
             papers=papers,
@@ -569,21 +577,42 @@ def build_scheduler_only_bucket_plan(
             )
             return comparison
 
-        schedule = schedule_cache_aware_sequential_evsi(
-            papers,
-            [],
-            reveal_comparison=reveal_cached,
-            k=bucket.k,
-            budget=budget,
-            seed=seed,
-            diagnostics=diagnostics,
-            config=SequentialEVSISchedulerConfig(
-                evsi=EVSISchedulerConfig(samples=1200),
-                rounds=5,
-                batch_size=4,
-                stop_on_novel=True,
-            ),
-        )
+        if scheduler_kind == "sequential_evsi":
+            schedule = schedule_cache_aware_sequential_evsi(
+                papers,
+                [],
+                reveal_comparison=reveal_cached,
+                k=bucket.k,
+                budget=budget,
+                seed=seed,
+                diagnostics=diagnostics,
+                config=SequentialEVSISchedulerConfig(
+                    evsi=EVSISchedulerConfig(samples=1200),
+                    rounds=5,
+                    batch_size=4,
+                    stop_on_novel=True,
+                ),
+            )
+        else:
+            schedule = schedule_cache_aware_cctd_gf(
+                papers,
+                [],
+                reveal_comparison=reveal_cached,
+                k=bucket.k,
+                budget=budget,
+                seed=seed,
+                diagnostics=diagnostics,
+                config=CCTDGFSchedulerConfig(
+                    evsi=EVSISchedulerConfig(
+                        samples=256,
+                        calibration_fraction=0.0,
+                        per_item_cap=6,
+                    ),
+                    rounds=4,
+                    batch_size=5,
+                    stop_on_novel=True,
+                ),
+            )
     else:
         raise ValueError(f"unknown scheduler_kind {scheduler_kind!r}")
     if not reusable_stats:
@@ -1228,8 +1257,8 @@ def _validate_scheduler_only_paid_preconditions(
 ) -> None:
     if max_usd <= 0:
         raise PaidRunSafetyError("--max-usd must be greater than zero")
-    if max_usd > 0.50:
-        raise PaidRunSafetyError("scheduler-only --max-usd must not exceed 0.50")
+    if max_usd > 2.00:
+        raise PaidRunSafetyError("scheduler-only --max-usd must not exceed 2.00")
     if estimate_usd > max_usd:
         raise PaidRunSafetyError("scheduler-only dry-run estimate exceeds --max-usd")
     if artifact_dir.resolve() == source_artifact_dir.resolve():
@@ -1354,6 +1383,62 @@ def _sequential_evsi_completion_payload(
     if scheduler_kind != "sequential_evsi":
         return None
 
+    buckets = []
+    complete_count = 0
+    for plan in plans:
+        diagnostics = plan.diagnostics
+        acquisition = diagnostics.get("acquisition") or {}
+        budget = int(diagnostics.get("budget") or len(plan.schedule))
+        rounds = int(acquisition.get("rounds") or 0)
+        batch_size = max(1, int(acquisition.get("batch_size") or 1))
+        target_pairs = budget
+        if rounds > 0:
+            target_pairs = min(budget, rounds * batch_size)
+        scheduled_total = int(
+            diagnostics.get("scheduled_total") or len(plan.schedule)
+        )
+        stopped_on_novel = bool(diagnostics.get("stopped_on_novel", False))
+        complete = scheduled_total >= target_pairs or not stopped_on_novel
+        if complete:
+            complete_count += 1
+        buckets.append(
+            {
+                "bucket": plan.bucket.name,
+                "scheduled_total": scheduled_total,
+                "target_pairs": target_pairs,
+                "stopped_on_novel": stopped_on_novel,
+                "current_invocation_novel_pairs": plan.reusable_stats[
+                    "scheduled_novel_total"
+                ],
+                "complete": complete,
+            }
+        )
+
+    return {
+        "status": (
+            "complete"
+            if complete_count == len(plans)
+            else "needs_guarded_paid_resume"
+        ),
+        "complete_bucket_count": complete_count,
+        "bucket_count": len(plans),
+        "buckets": buckets,
+    }
+
+
+def _cctd_gf_completion_payload(
+    *,
+    scheduler_kind: str,
+    plans: list[SchedulerOnlyBucketPlan],
+) -> dict[str, Any] | None:
+    if scheduler_kind != "cctd_gf":
+        return None
+    return _adaptive_completion_payload(plans)
+
+
+def _adaptive_completion_payload(
+    plans: list[SchedulerOnlyBucketPlan],
+) -> dict[str, Any]:
     buckets = []
     complete_count = 0
     for plan in plans:

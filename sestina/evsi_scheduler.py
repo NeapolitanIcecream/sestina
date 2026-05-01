@@ -43,6 +43,25 @@ class SequentialEVSISchedulerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class CCTDGFSchedulerConfig:
+    evsi: EVSISchedulerConfig = field(
+        default_factory=lambda: EVSISchedulerConfig(
+            samples=256,
+            calibration_fraction=0.0,
+            per_item_cap=6,
+        )
+    )
+    rounds: int = 4
+    batch_size: int = 5
+    disagreement_pairs_per_round: int = 3
+    graph_floor_pairs_per_round: int = 1
+    random_floor_pairs_per_round: int = 1
+    high_score_fraction: float = 0.30
+    sampling_temperature: float = 0.70
+    stop_on_novel: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class _PosteriorItem:
     paper_id: str
     mean: float
@@ -66,6 +85,7 @@ class _AcquisitionProposal:
 
 @dataclass(frozen=True, slots=True)
 class _EVSIContext:
+    aggregation: Any
     posterior: TopKPosterior
     items: list[_PosteriorItem]
     pool: list[_PosteriorItem]
@@ -516,6 +536,254 @@ def schedule_cache_aware_sequential_evsi(
     return PairSchedule(pairs=selected_pairs, budget=budget, diagnostics=payload)
 
 
+def schedule_cache_aware_cctd_gf(
+    papers: list[Paper],
+    comparisons: list[PairwiseComparison],
+    *,
+    reveal_comparison: Callable[[ScheduledPair], PairwiseComparison | None],
+    k: int,
+    budget: PairwiseBudget,
+    seed: int = 0,
+    config: CCTDGFSchedulerConfig | None = None,
+    diagnostics: DiagnosticRecorder | None = None,
+) -> PairSchedule:
+    """Select CCTD-GF pairs in mini-batches, revealing cached labels by batch."""
+    cfg = config or CCTDGFSchedulerConfig()
+    evsi_cfg = cfg.evsi
+    recorder = diagnostics or DiagnosticRecorder()
+    paper_by_id = {paper.paper_id: paper for paper in papers}
+    if budget.budget <= 0 or len(paper_by_id) < 2 or k <= 0:
+        payload = _empty_schedule_diagnostics(
+            k=k,
+            budget=budget.budget,
+            method="cctd_gf",
+        )
+        payload.update(
+            {
+                "batch_history": [],
+                "cached_label_revealed_total": 0,
+                "novel_pairs_total": 0,
+                "stopped_on_novel": False,
+                "cctd_gf_score_distribution": _evsi_score_distribution([]),
+            }
+        )
+        recorder.record(
+            step="pair_scheduling",
+            code="cctd_gf_pair_scheduling_empty",
+            message="no CCTD-GF comparisons scheduled",
+            data=payload,
+        )
+        return PairSchedule(pairs=[], budget=budget, diagnostics=payload)
+
+    revealed_comparisons = list(comparisons)
+    selected_pairs: list[ScheduledPair] = []
+    selected_keys: set[tuple[str, str]] = {
+        _pair_key(comparison.left_id, comparison.right_id)
+        for comparison in comparisons
+    }
+    batch_history: list[dict[str, Any]] = []
+    all_evsi_proposals: list[_AcquisitionProposal] = []
+    all_cctd_proposals: list[_AcquisitionProposal] = []
+    cached_revealed_total = 0
+    novel_total = 0
+    stopped_on_novel = False
+    last_items: list[_PosteriorItem] = []
+    last_pool: list[_PosteriorItem] = []
+
+    max_rounds = max(0, int(cfg.rounds))
+    batch_size = max(1, int(cfg.batch_size))
+    for batch_index in range(max_rounds):
+        remaining_budget = budget.budget - len(selected_pairs)
+        if remaining_budget <= 0:
+            break
+        batch_budget = min(batch_size, remaining_budget)
+        batch_seed = seed + (batch_index * 9973)
+        context = _build_evsi_context(
+            papers,
+            comparisons=revealed_comparisons,
+            k=k,
+            seed=batch_seed,
+            config=evsi_cfg,
+            seen_pairs=selected_keys,
+            diagnostics=recorder,
+        )
+        last_items = context.items
+        last_pool = context.pool
+        all_evsi_proposals.extend(context.proposals)
+        before_entropy = _posterior_top_k_entropy(context.posterior)
+        before_top_k = _posterior_top_k_set(context.posterior, k=k)
+        active_degrees = _active_degrees(
+            selected_pairs=selected_pairs,
+            comparisons=revealed_comparisons,
+        )
+        component_by_id = _active_component_by_id(
+            [paper.paper_id for paper in papers],
+            selected_pairs=selected_pairs,
+            comparisons=revealed_comparisons,
+        )
+        scored_proposals = _cctd_gf_proposals(
+            context,
+            k=k,
+            seed=batch_seed,
+            config=cfg,
+            active_degrees=active_degrees,
+            component_by_id=component_by_id,
+        )
+        all_cctd_proposals.extend(scored_proposals)
+        batch_proposals = _select_cctd_gf_batch(
+            scored_proposals,
+            budget=batch_budget,
+            seed=batch_seed,
+            config=cfg,
+            active_degrees=active_degrees,
+        )
+        batch_pairs = _scheduled_pairs_from_proposals(
+            batch_proposals,
+            seed=batch_seed,
+            start_index=len(selected_pairs),
+        )
+        batch_pairs = [
+            _annotate_cctd_batch_pair(
+                pair,
+                batch_index=batch_index + 1,
+                global_index=len(selected_pairs) + offset,
+            )
+            for offset, pair in enumerate(batch_pairs)
+        ]
+        if not batch_pairs:
+            batch_history.append(
+                {
+                    "batch_index": batch_index + 1,
+                    "selected_total": 0,
+                    "comparisons_before_batch": len(revealed_comparisons),
+                    "comparisons_after_batch": len(revealed_comparisons),
+                    "proposal_count": len(context.proposals),
+                    "scored_proposal_count": len(scored_proposals),
+                    "top_k_entropy_before": before_entropy,
+                    "top_k_entropy_after": before_entropy,
+                    "top_k_entropy_reduction": 0.0,
+                    "top_k_set_churn": 0.0,
+                    "stop_reason": "no_feasible_pairs",
+                }
+            )
+            break
+
+        selected_pairs.extend(batch_pairs)
+        selected_keys.update(_pair_key(pair.left_id, pair.right_id) for pair in batch_pairs)
+        cached_in_batch = 0
+        novel_in_batch = 0
+        for pair in batch_pairs:
+            comparison = reveal_comparison(pair)
+            if comparison is None:
+                novel_in_batch += 1
+                continue
+            revealed_comparisons.append(_orient_revealed_comparison(comparison, pair))
+            cached_in_batch += 1
+
+        cached_revealed_total += cached_in_batch
+        novel_total += novel_in_batch
+        if cached_in_batch:
+            after_context = _build_evsi_context(
+                papers,
+                comparisons=revealed_comparisons,
+                k=k,
+                seed=batch_seed + 1,
+                config=evsi_cfg,
+                seen_pairs=selected_keys,
+                diagnostics=recorder,
+            )
+            after_entropy = _posterior_top_k_entropy(after_context.posterior)
+            after_top_k = _posterior_top_k_set(after_context.posterior, k=k)
+            last_items = after_context.items
+            last_pool = after_context.pool
+        else:
+            after_entropy = before_entropy
+            after_top_k = before_top_k
+        batch_history.append(
+            {
+                "batch_index": batch_index + 1,
+                "selected_total": len(batch_pairs),
+                "purpose_counts": dict(
+                    sorted(Counter(pair.purpose for pair in batch_pairs).items())
+                ),
+                "cached_label_revealed_total": cached_in_batch,
+                "novel_pairs_total": novel_in_batch,
+                "comparisons_before_batch": len(revealed_comparisons) - cached_in_batch,
+                "comparisons_after_batch": len(revealed_comparisons),
+                "proposal_count": len(context.proposals),
+                "scored_proposal_count": len(scored_proposals),
+                "top_k_entropy_before": before_entropy,
+                "top_k_entropy_after": after_entropy,
+                "top_k_entropy_reduction": round(before_entropy - after_entropy, 8),
+                "top_k_set_churn": _top_k_set_churn(before_top_k, after_top_k),
+                "stop_reason": (
+                    "novel_pair_without_revealed_label"
+                    if novel_in_batch and cfg.stop_on_novel
+                    else None
+                ),
+            }
+        )
+        if novel_in_batch and cfg.stop_on_novel:
+            stopped_on_novel = True
+            break
+
+    payload = {
+        "candidate_count": len({item.paper_id for item in last_pool}),
+        "scheduled_total": len(selected_pairs),
+        "pairs_considered": len(all_evsi_proposals),
+        "unique_pairs_considered": len(
+            {_pair_key(proposal.left_id, proposal.right_id) for proposal in all_evsi_proposals}
+        ),
+        "budget": budget.budget,
+        "k": k,
+        "acquisition": {
+            "method": "cctd_gf",
+            "source_method": "top_k_evsi_approximation",
+            "rounds": cfg.rounds,
+            "batch_size": cfg.batch_size,
+            "disagreement_pairs_per_round": cfg.disagreement_pairs_per_round,
+            "graph_floor_pairs_per_round": cfg.graph_floor_pairs_per_round,
+            "random_floor_pairs_per_round": cfg.random_floor_pairs_per_round,
+            "high_score_fraction": cfg.high_score_fraction,
+            "sampling_temperature": cfg.sampling_temperature,
+            "stop_on_novel": cfg.stop_on_novel,
+            "posterior_samples": evsi_cfg.samples,
+            "pool_multiplier": evsi_cfg.pool_multiplier,
+            "per_item_cap": evsi_cfg.per_item_cap,
+        },
+        "purpose_counts": dict(
+            sorted(Counter(pair.purpose for pair in selected_pairs).items())
+        ),
+        "coverage": {
+            **_evsi_coverage(
+                selected_pairs,
+                item_by_id={item.paper_id: item for item in last_items},
+            ),
+            **_cctd_graph_coverage(selected_pairs),
+        },
+        "proposal_pool_profile": _proposal_pool_profile(
+            items=last_items,
+            pool=last_pool,
+            scheduled=selected_pairs,
+            k=k,
+        ),
+        "evsi_score_distribution": _evsi_score_distribution(all_evsi_proposals),
+        "cctd_gf_score_distribution": _evsi_score_distribution(all_cctd_proposals),
+        "batch_history": batch_history,
+        "cached_label_revealed_total": cached_revealed_total,
+        "novel_pairs_total": novel_total,
+        "stopped_on_novel": stopped_on_novel,
+        "known_comparisons_final": len(revealed_comparisons),
+    }
+    recorder.record(
+        step="pair_scheduling",
+        code="cctd_gf_pair_scheduling_completed",
+        message="scheduled CCTD-GF active comparisons",
+        data=payload,
+    )
+    return PairSchedule(pairs=selected_pairs, budget=budget, diagnostics=payload)
+
+
 def _build_evsi_context(
     papers: list[Paper],
     *,
@@ -555,6 +823,7 @@ def _build_evsi_context(
         config=config,
     )
     return _EVSIContext(
+        aggregation=aggregation,
         posterior=posterior,
         items=items,
         pool=pool,
@@ -840,6 +1109,367 @@ def _select_random_evsi_pairs(
     )
 
 
+def _cctd_gf_proposals(
+    context: _EVSIContext,
+    *,
+    k: int,
+    seed: int,
+    config: CCTDGFSchedulerConfig,
+    active_degrees: Counter[str],
+    component_by_id: dict[str, int],
+) -> list[_AcquisitionProposal]:
+    if not context.proposals:
+        return []
+    item_by_id = {item.paper_id: item for item in context.items}
+    decision_ids = _cctd_decision_ids(context.items, k=k)
+    top_k_ids = _posterior_top_k_set(context.posterior, k=k)
+    samples = _posterior_latent_samples(
+        context.aggregation,
+        k=k,
+        samples=config.evsi.samples,
+        seed=seed,
+    )
+    proposals: list[_AcquisitionProposal] = []
+    for proposal in context.proposals:
+        left = item_by_id[proposal.left_id]
+        right = item_by_id[proposal.right_id]
+        pair_stats = _cctd_pair_stats(
+            left.paper_id,
+            right.paper_id,
+            samples=samples,
+            temperature=config.evsi.temperature,
+        )
+        left_degree = active_degrees[left.paper_id]
+        right_degree = active_degrees[right.paper_id]
+        low_degree_bonus = 0.5 * (
+            (1.0 / (1.0 + left_degree)) + (1.0 / (1.0 + right_degree))
+        )
+        cross_component = component_by_id.get(left.paper_id) != component_by_id.get(
+            right.paper_id
+        )
+        cross_boundary = (left.paper_id in top_k_ids) != (right.paper_id in top_k_ids)
+        decision_pair = left.paper_id in decision_ids or right.paper_id in decision_ids
+        boundary_relevance = left.boundary_mass + right.boundary_mass
+        graph_coverage_bonus = (
+            1.0
+            + (0.35 * low_degree_bonus)
+            + (0.20 if cross_component else 0.0)
+            + (0.20 if cross_boundary else 0.0)
+        )
+        anti_redundancy_penalty = 1.0 / (
+            1.0 + max(0.0, ((left_degree + right_degree) / 2.0) - 1.0)
+        )
+        score = (
+            (
+                0.60 * pair_stats["top_k_disagreement"]
+                + 0.30 * pair_stats["pair_information"]
+                + 0.10 * min(1.0, boundary_relevance / 2.0)
+            )
+            * graph_coverage_bonus
+            * anti_redundancy_penalty
+        )
+        graph_floor_score = (
+            (
+                0.40
+                * (
+                    pair_stats["top_k_disagreement"]
+                    + pair_stats["pair_information"]
+                )
+            )
+            + (0.30 * low_degree_bonus)
+            + (0.20 if cross_component else 0.0)
+            + (0.10 if cross_boundary else 0.0)
+        ) * (0.50 + min(1.0, boundary_relevance / 2.0))
+        diagnostics = dict(proposal.diagnostics)
+        diagnostics.update(
+            {
+                "acquisition_score": round(score, 8),
+                "cctd_gf_score": round(score, 8),
+                "graph_floor_score": round(graph_floor_score, 8),
+                "top_k_disagreement": round(pair_stats["top_k_disagreement"], 8),
+                "pair_information": round(pair_stats["pair_information"], 8),
+                "mean_head_to_head_probability": round(
+                    pair_stats["mean_head_to_head_probability"],
+                    8,
+                ),
+                "mean_pair_entropy": round(pair_stats["mean_pair_entropy"], 8),
+                "expected_pair_entropy": round(
+                    pair_stats["expected_pair_entropy"],
+                    8,
+                ),
+                "score_probability_gap": round(
+                    abs(pair_stats["mean_head_to_head_probability"] - 0.5),
+                    8,
+                ),
+                "latent_score_gap": round(abs(left.mean - right.mean), 8),
+                "graph_coverage_bonus": round(graph_coverage_bonus, 8),
+                "anti_redundancy_penalty": round(anti_redundancy_penalty, 8),
+                "active_degree_left": int(left_degree),
+                "active_degree_right": int(right_degree),
+                "low_degree_bonus": round(low_degree_bonus, 8),
+                "cross_component": bool(cross_component),
+                "cross_decision_boundary": bool(cross_boundary),
+                "decision_set_pair": bool(decision_pair),
+                "left_in_decision_set": left.paper_id in decision_ids,
+                "right_in_decision_set": right.paper_id in decision_ids,
+                "left_in_posterior_top_k": left.paper_id in top_k_ids,
+                "right_in_posterior_top_k": right.paper_id in top_k_ids,
+            }
+        )
+        proposals.append(
+            _AcquisitionProposal(
+                left_id=proposal.left_id,
+                right_id=proposal.right_id,
+                score=score,
+                purpose="cctd_gf_candidate",
+                diagnostics=diagnostics,
+            )
+        )
+    return sorted(
+        proposals,
+        key=lambda item: (item.score, item.left_id, item.right_id),
+        reverse=True,
+    )
+
+
+def _select_cctd_gf_batch(
+    proposals: list[_AcquisitionProposal],
+    *,
+    budget: int,
+    seed: int,
+    config: CCTDGFSchedulerConfig,
+    active_degrees: Counter[str],
+) -> list[_AcquisitionProposal]:
+    if budget <= 0 or not proposals:
+        return []
+    targets = _cctd_round_targets(config, budget=budget)
+    rng = random.Random(seed)
+    selected: list[_AcquisitionProposal] = []
+    selected_keys: set[tuple[str, str]] = set()
+    item_counts: Counter[str] = Counter(active_degrees)
+    cap = config.evsi.per_item_cap or max(
+        2,
+        math.ceil((2.5 * budget) / max(1, len(proposals) ** 0.5)),
+    )
+
+    def available(proposal: _AcquisitionProposal, *, relax_cap: bool = False) -> bool:
+        key = _pair_key(proposal.left_id, proposal.right_id)
+        if key in selected_keys:
+            return False
+        if relax_cap:
+            return True
+        return (
+            item_counts[proposal.left_id] < cap
+            and item_counts[proposal.right_id] < cap
+        )
+
+    def take(proposal: _AcquisitionProposal) -> None:
+        selected.append(proposal)
+        selected_keys.add(_pair_key(proposal.left_id, proposal.right_id))
+        item_counts[proposal.left_id] += 1
+        item_counts[proposal.right_id] += 1
+
+    for _ in range(targets["graph"]):
+        proposal = _select_cctd_graph_floor_candidate(
+            proposals,
+            available=available,
+        )
+        if proposal is not None:
+            take(_with_purpose(proposal, "cctd_gf_graph_floor"))
+
+    for _ in range(targets["random"]):
+        proposal = _select_cctd_random_candidate(
+            proposals,
+            rng=rng,
+            available=available,
+        )
+        if proposal is not None:
+            take(_with_purpose(proposal, "cctd_gf_random_floor"))
+
+    for _ in range(targets["disagreement"]):
+        candidates = _sample_cctd_disagreement_candidates(
+            proposals,
+            needed=1,
+            rng=rng,
+            config=config,
+            available=available,
+        )
+        if not candidates:
+            break
+        take(_with_purpose(candidates[0], "cctd_gf_disagreement"))
+
+    if len(selected) < budget:
+        for purpose in (
+            "cctd_gf_disagreement",
+            "cctd_gf_graph_floor",
+            "cctd_gf_random_floor",
+        ):
+            for proposal in proposals:
+                if len(selected) >= budget:
+                    break
+                if not available(proposal, relax_cap=True):
+                    continue
+                take(_with_purpose(proposal, purpose))
+            if len(selected) >= budget:
+                break
+
+    return selected[:budget]
+
+
+def _cctd_round_targets(
+    config: CCTDGFSchedulerConfig,
+    *,
+    budget: int,
+) -> dict[str, int]:
+    sequence = (
+        ["disagreement"] * max(0, int(config.disagreement_pairs_per_round))
+        + ["graph"] * max(0, int(config.graph_floor_pairs_per_round))
+        + ["random"] * max(0, int(config.random_floor_pairs_per_round))
+    )
+    if not sequence:
+        sequence = ["disagreement"]
+    selected = sequence[: max(0, int(budget))]
+    counts = Counter(selected)
+    remaining = max(0, int(budget)) - len(selected)
+    if remaining:
+        counts["disagreement"] += remaining
+    return {
+        "disagreement": int(counts["disagreement"]),
+        "graph": int(counts["graph"]),
+        "random": int(counts["random"]),
+    }
+
+
+def _select_cctd_graph_floor_candidate(
+    proposals: list[_AcquisitionProposal],
+    *,
+    available: Callable[[_AcquisitionProposal], bool],
+) -> _AcquisitionProposal | None:
+    candidates = [
+        proposal
+        for proposal in proposals
+        if available(proposal)
+        and bool(proposal.diagnostics.get("decision_set_pair"))
+        and bool(proposal.diagnostics.get("cross_decision_boundary"))
+    ]
+    if not candidates:
+        candidates = [
+            proposal
+            for proposal in proposals
+            if available(proposal)
+            and (
+                float(proposal.diagnostics.get("top_k_disagreement", 0.0)) > 0.0
+                or float(proposal.diagnostics.get("pair_information", 0.0)) > 0.0
+            )
+        ]
+    if not candidates:
+        candidates = [proposal for proposal in proposals if available(proposal)]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda proposal: (
+            float(proposal.diagnostics.get("graph_floor_score", 0.0)),
+            -int(proposal.diagnostics.get("active_degree_left", 0)),
+            -int(proposal.diagnostics.get("active_degree_right", 0)),
+            proposal.left_id,
+            proposal.right_id,
+        ),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def _select_cctd_random_candidate(
+    proposals: list[_AcquisitionProposal],
+    *,
+    rng: random.Random,
+    available: Callable[[_AcquisitionProposal], bool],
+) -> _AcquisitionProposal | None:
+    candidates = [proposal for proposal in proposals if available(proposal)]
+    if not candidates:
+        return None
+    return rng.choice(candidates)
+
+
+def _sample_cctd_disagreement_candidates(
+    proposals: list[_AcquisitionProposal],
+    *,
+    needed: int,
+    rng: random.Random,
+    config: CCTDGFSchedulerConfig,
+    available: Callable[[_AcquisitionProposal], bool],
+) -> list[_AcquisitionProposal]:
+    selected: list[_AcquisitionProposal] = []
+    while len(selected) < needed:
+        candidates = [
+            proposal
+            for proposal in proposals
+            if available(proposal) and proposal not in selected
+        ]
+        if not candidates:
+            break
+        candidates.sort(
+            key=lambda proposal: (proposal.score, proposal.left_id, proposal.right_id),
+            reverse=True,
+        )
+        high_count = max(
+            1,
+            min(
+                len(candidates),
+                math.ceil(len(candidates) * max(0.05, config.high_score_fraction)),
+            ),
+        )
+        high_scoring = candidates[:high_count]
+        selected.append(
+            _weighted_cctd_choice(
+                high_scoring,
+                rng=rng,
+                temperature=config.sampling_temperature,
+            )
+        )
+    return selected
+
+
+def _weighted_cctd_choice(
+    proposals: list[_AcquisitionProposal],
+    *,
+    rng: random.Random,
+    temperature: float,
+) -> _AcquisitionProposal:
+    if len(proposals) == 1:
+        return proposals[0]
+    scores = [proposal.score for proposal in proposals]
+    low = min(scores)
+    high = max(scores)
+    span = max(high - low, 1e-9)
+    temp = max(temperature, 1e-6)
+    weights = [math.exp(((score - low) / span) / temp) for score in scores]
+    total = sum(weights)
+    threshold = rng.random() * total
+    running = 0.0
+    for proposal, weight in zip(proposals, weights, strict=True):
+        running += weight
+        if running >= threshold:
+            return proposal
+    return proposals[-1]
+
+
+def _with_purpose(
+    proposal: _AcquisitionProposal,
+    purpose: str,
+) -> _AcquisitionProposal:
+    diagnostics = dict(proposal.diagnostics)
+    diagnostics["source_cctd_gf_purpose"] = proposal.purpose
+    diagnostics["selected_cctd_gf_purpose"] = purpose
+    return _AcquisitionProposal(
+        left_id=proposal.left_id,
+        right_id=proposal.right_id,
+        score=proposal.score,
+        purpose=purpose,
+        diagnostics=diagnostics,
+    )
+
+
 def _scheduled_pairs_from_proposals(
     proposals: list[_AcquisitionProposal],
     *,
@@ -914,6 +1544,172 @@ def _annotate_batch_pair(
     )
 
 
+def _annotate_cctd_batch_pair(
+    pair: ScheduledPair,
+    *,
+    batch_index: int,
+    global_index: int,
+) -> ScheduledPair:
+    order_extra = dict(pair.order.extra)
+    order_extra["cctd_gf_batch_index"] = batch_index
+    diagnostics = dict(pair.diagnostics)
+    diagnostics["cctd_gf_batch_index"] = batch_index
+    return ScheduledPair(
+        left_id=pair.left_id,
+        right_id=pair.right_id,
+        priority=pair.priority,
+        purpose=pair.purpose,
+        order=PairwiseOrderMetadata(
+            shown_first_id=pair.order.shown_first_id,
+            shown_second_id=pair.order.shown_second_id,
+            randomized=pair.order.randomized,
+            seed=pair.order.seed,
+            position_bias_audit=(global_index % 5 == 0),
+            extra=order_extra,
+        ),
+        diagnostics=diagnostics,
+    )
+
+
+def _posterior_latent_samples(
+    aggregation: Any,
+    *,
+    k: int,
+    samples: int,
+    seed: int,
+) -> dict[str, Any]:
+    estimates = list(aggregation.estimates.values())
+    sample_count = max(100, int(samples))
+    rng = random.Random(seed)
+    draws_by_id = {estimate.paper_id: [] for estimate in estimates}
+    top_k_sets: list[set[str]] = []
+    for _ in range(sample_count):
+        draw = []
+        for estimate in estimates:
+            value = rng.gauss(
+                estimate.posterior_logit,
+                math.sqrt(max(estimate.variance, 1e-9)),
+            )
+            draws_by_id[estimate.paper_id].append(value)
+            draw.append((value, estimate.paper_id))
+        draw.sort(reverse=True)
+        top_k_sets.append({paper_id for _, paper_id in draw[: max(0, k)]})
+    return {
+        "draws_by_id": draws_by_id,
+        "top_k_sets": top_k_sets,
+        "samples": sample_count,
+    }
+
+
+def _cctd_pair_stats(
+    left_id: str,
+    right_id: str,
+    *,
+    samples: dict[str, Any],
+    temperature: float,
+) -> dict[str, float]:
+    left_draws = samples["draws_by_id"].get(left_id, [])
+    right_draws = samples["draws_by_id"].get(right_id, [])
+    top_k_sets = samples["top_k_sets"]
+    sample_count = max(1, int(samples["samples"]))
+    disagreement = sum(
+        (left_id in top_k_set) != (right_id in top_k_set)
+        for top_k_set in top_k_sets
+    ) / sample_count
+    probabilities = [
+        _sigmoid((left_value - right_value) / max(temperature, 1e-9))
+        for left_value, right_value in zip(left_draws, right_draws, strict=True)
+    ]
+    if not probabilities:
+        mean_probability = 0.5
+        expected_entropy = _binary_entropy(mean_probability)
+    else:
+        mean_probability = sum(probabilities) / len(probabilities)
+        expected_entropy = sum(_binary_entropy(value) for value in probabilities) / len(
+            probabilities
+        )
+    mean_entropy = _binary_entropy(mean_probability)
+    information = max(0.0, mean_entropy - expected_entropy)
+    return {
+        "top_k_disagreement": disagreement,
+        "mean_head_to_head_probability": mean_probability,
+        "mean_pair_entropy": mean_entropy,
+        "expected_pair_entropy": expected_entropy,
+        "pair_information": information,
+    }
+
+
+def _cctd_decision_ids(items: list[_PosteriorItem], *, k: int) -> set[str]:
+    limit = max(1, k)
+    by_top_k = sorted(
+        items,
+        key=lambda item: (item.top_k_probability, item.mean, item.paper_id),
+        reverse=True,
+    )[:limit]
+    by_ucb = sorted(
+        items,
+        key=lambda item: (item.ucb, item.top_k_probability, item.paper_id),
+        reverse=True,
+    )[:limit]
+    by_boundary = sorted(
+        items,
+        key=lambda item: (item.boundary_mass, item.top_k_probability, item.paper_id),
+        reverse=True,
+    )[: max(limit, 2 * limit)]
+    return {item.paper_id for item in _ordered_unique(by_top_k, by_ucb, by_boundary)}
+
+
+def _active_degrees(
+    *,
+    selected_pairs: list[ScheduledPair],
+    comparisons: list[PairwiseComparison],
+) -> Counter[str]:
+    degrees: Counter[str] = Counter()
+    selected_keys = {_pair_key(pair.left_id, pair.right_id) for pair in selected_pairs}
+    for pair in selected_pairs:
+        degrees[pair.left_id] += 1
+        degrees[pair.right_id] += 1
+    for comparison in comparisons:
+        if _pair_key(comparison.left_id, comparison.right_id) in selected_keys:
+            continue
+        degrees[comparison.left_id] += 1
+        degrees[comparison.right_id] += 1
+    return degrees
+
+
+def _active_component_by_id(
+    paper_ids: list[str],
+    *,
+    selected_pairs: list[ScheduledPair],
+    comparisons: list[PairwiseComparison],
+) -> dict[str, int]:
+    graph = {paper_id: set() for paper_id in paper_ids}
+    selected_keys = {_pair_key(pair.left_id, pair.right_id) for pair in selected_pairs}
+    for pair in selected_pairs:
+        graph.setdefault(pair.left_id, set()).add(pair.right_id)
+        graph.setdefault(pair.right_id, set()).add(pair.left_id)
+    for comparison in comparisons:
+        if _pair_key(comparison.left_id, comparison.right_id) in selected_keys:
+            continue
+        graph.setdefault(comparison.left_id, set()).add(comparison.right_id)
+        graph.setdefault(comparison.right_id, set()).add(comparison.left_id)
+    component_by_id: dict[str, int] = {}
+    seen: set[str] = set()
+    for paper_id in sorted(graph):
+        if paper_id in seen:
+            continue
+        component_id = len(set(component_by_id.values()))
+        stack = [paper_id]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            component_by_id[current] = component_id
+            stack.extend(sorted(graph.get(current, set()) - seen))
+    return component_by_id
+
+
 def _orient_revealed_comparison(
     comparison: PairwiseComparison,
     pair: ScheduledPair,
@@ -975,6 +1771,54 @@ def _evsi_coverage(
         else 0.0,
         "top_k_probability_mass": round(
             sum(item.top_k_probability for item in item_by_id.values()),
+            8,
+        ),
+    }
+
+
+def _cctd_graph_coverage(scheduled: list[ScheduledPair]) -> dict[str, Any]:
+    if not scheduled:
+        return {
+            "graph_floor_pairs": 0,
+            "random_floor_pairs": 0,
+            "disagreement_pairs": 0,
+            "cross_component_pairs": 0,
+            "decision_boundary_pairs": 0,
+            "average_top_k_disagreement": 0.0,
+            "average_pair_information": 0.0,
+        }
+    return {
+        "graph_floor_pairs": sum(
+            1 for pair in scheduled if pair.purpose == "cctd_gf_graph_floor"
+        ),
+        "random_floor_pairs": sum(
+            1 for pair in scheduled if pair.purpose == "cctd_gf_random_floor"
+        ),
+        "disagreement_pairs": sum(
+            1 for pair in scheduled if pair.purpose == "cctd_gf_disagreement"
+        ),
+        "cross_component_pairs": sum(
+            1 for pair in scheduled if bool(pair.diagnostics.get("cross_component"))
+        ),
+        "decision_boundary_pairs": sum(
+            1
+            for pair in scheduled
+            if bool(pair.diagnostics.get("cross_decision_boundary"))
+        ),
+        "average_top_k_disagreement": round(
+            sum(
+                float(pair.diagnostics.get("top_k_disagreement", 0.0))
+                for pair in scheduled
+            )
+            / len(scheduled),
+            8,
+        ),
+        "average_pair_information": round(
+            sum(
+                float(pair.diagnostics.get("pair_information", 0.0))
+                for pair in scheduled
+            )
+            / len(scheduled),
             8,
         ),
     }

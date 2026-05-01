@@ -372,6 +372,41 @@ def test_scheduler_only_sequential_evsi_paid_resume_reveals_followup_labels(
     assert chat_calls == 4
 
 
+def test_scheduler_only_cctd_gf_mode_reports_mixed_batch_diagnostics(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_config(tmp_path)
+    papers = _many_manifest_papers(n=32, k=5)
+    manifest_path = _write_manifest_for_papers(tmp_path, papers=papers, k=5)
+    source_dir = tmp_path / "source"
+    _write_pointwise_artifacts_for_papers(source_dir, papers=papers)
+
+    summary = SchedulerOnlyRunner(
+        config_path=config_path,
+        manifest_path=manifest_path,
+        source_artifact_dir=source_dir,
+        artifact_dir=tmp_path / "dry",
+        ledger_path=tmp_path / "dry" / "ledger.jsonl",
+        max_usd=2.00,
+        scheduler_kind="cctd_gf",
+        aggregation_mode="posterior_topk",
+    ).run()
+
+    estimate = json.loads(Path(summary["estimate_path"]).read_text())
+    diagnostics = estimate["buckets"][0]["scheduler_diagnostics"]
+    assert summary["scheduler_kind"] == "cctd_gf"
+    assert summary["pairwise_scheduled_total"] == 5
+    assert diagnostics["acquisition"]["method"] == "cctd_gf"
+    assert diagnostics["purpose_counts"] == {
+        "cctd_gf_disagreement": 3,
+        "cctd_gf_graph_floor": 1,
+        "cctd_gf_random_floor": 1,
+    }
+    assert diagnostics["batch_history"][0]["selected_total"] == 5
+    assert diagnostics["cctd_gf_score_distribution"]["proposal_count"] > 0
+    assert summary["cctd_gf_completion"]["status"] == "needs_guarded_paid_resume"
+
+
 def _write_config(tmp_path: Path) -> Path:
     path = tmp_path / "config.json"
     path.write_text(

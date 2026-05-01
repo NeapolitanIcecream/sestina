@@ -52,7 +52,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--max-usd",
         type=float,
         required=True,
-        help="scheduler-only hard cap in USD; paid runs require <= 0.50",
+        help="scheduler-only hard cap in USD; paid runs require <= 2.00",
     )
     parser.add_argument(
         "--artifact-dir",
@@ -74,7 +74,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument(
         "--scheduler-kind",
-        choices=["quota", "evsi", "exact_pool_random", "sequential_evsi"],
+        choices=[
+            "quota",
+            "evsi",
+            "exact_pool_random",
+            "sequential_evsi",
+            "cctd_gf",
+        ],
         default="quota",
         help="active pair scheduler to use for the follow-up",
     )
