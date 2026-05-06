@@ -288,6 +288,104 @@ def test_scheduler_only_exact_pool_random_mode_reports_pool_diagnostics(
     assert "offline_bucket_results_path" in summary
 
 
+def test_scheduler_only_expanded_pool_random_widens_candidate_construction(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_config(tmp_path)
+    papers = _many_manifest_papers(n=48, k=5)
+    manifest_path = _write_manifest_for_papers(tmp_path, papers=papers, k=5)
+    source_dir = tmp_path / "source"
+    _write_pointwise_artifacts_for_papers(source_dir, papers=papers)
+
+    exact = SchedulerOnlyRunner(
+        config_path=config_path,
+        manifest_path=manifest_path,
+        source_artifact_dir=source_dir,
+        artifact_dir=tmp_path / "exact",
+        ledger_path=tmp_path / "exact" / "ledger.jsonl",
+        max_usd=0.50,
+        scheduler_kind="exact_pool_random",
+        aggregation_mode="posterior_topk",
+    ).run()
+    expanded = SchedulerOnlyRunner(
+        config_path=config_path,
+        manifest_path=manifest_path,
+        source_artifact_dir=source_dir,
+        artifact_dir=tmp_path / "expanded",
+        ledger_path=tmp_path / "expanded" / "ledger.jsonl",
+        max_usd=0.50,
+        scheduler_kind="expanded_pool_random",
+        aggregation_mode="posterior_topk",
+    ).run()
+
+    exact_diagnostics = json.loads(Path(exact["estimate_path"]).read_text())[
+        "buckets"
+    ][0]["scheduler_diagnostics"]
+    expanded_diagnostics = json.loads(Path(expanded["estimate_path"]).read_text())[
+        "buckets"
+    ][0]["scheduler_diagnostics"]
+    expanded_acquisition = expanded_diagnostics["acquisition"]
+    assert expanded["scheduler_kind"] == "expanded_pool_random"
+    assert expanded["pointwise_calls"] == 0
+    assert expanded_acquisition["method"] == "expanded_pool_random"
+    assert expanded_acquisition["candidate_construction_change"] == (
+        "expanded_dynamic_proposal_pool"
+    )
+    assert expanded_acquisition["pool_multiplier"] == 4
+    assert expanded_acquisition["diverse_outsider_count"] == 20
+    assert expanded_diagnostics["purpose_counts"] == {"expanded_pool_random": 12}
+    assert (
+        expanded_diagnostics["proposal_pool_profile"]["pool_item_count"]
+        > exact_diagnostics["proposal_pool_profile"]["pool_item_count"]
+    )
+    assert expanded["blocker"]["status"] == "blocked_on_paid_pairwise_labels"
+    assert not (tmp_path / "expanded" / "ledger.jsonl").exists()
+
+
+def test_scheduler_only_targeted_outsider_random_reports_construction_diagnostics(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_config(tmp_path)
+    papers = _many_manifest_papers(n=48, k=5)
+    manifest_path = _write_manifest_for_papers(tmp_path, papers=papers, k=5)
+    source_dir = tmp_path / "source"
+    _write_pointwise_artifacts_for_papers(source_dir, papers=papers)
+
+    summary = SchedulerOnlyRunner(
+        config_path=config_path,
+        manifest_path=manifest_path,
+        source_artifact_dir=source_dir,
+        artifact_dir=tmp_path / "targeted",
+        ledger_path=tmp_path / "targeted" / "ledger.jsonl",
+        max_usd=0.50,
+        scheduler_kind="targeted_outsider_random",
+        aggregation_mode="posterior_topk",
+    ).run()
+
+    diagnostics = json.loads(Path(summary["estimate_path"]).read_text())[
+        "buckets"
+    ][0]["scheduler_diagnostics"]
+    targeted = diagnostics["targeted_outsider"]
+    expanded_reference = targeted["pool_reference_deltas"]["expanded_pool"]
+    assert summary["scheduler_kind"] == "targeted_outsider_random"
+    assert summary["pointwise_calls"] == 0
+    assert diagnostics["acquisition"]["method"] == "targeted_outsider_random"
+    assert diagnostics["acquisition"]["selection_policy"] == (
+        "random_within_constructed_anchor_outsider_pairs"
+    )
+    assert diagnostics["purpose_counts"] == {"targeted_outsider_random": 12}
+    assert targeted["anchor_count"] >= 5
+    assert targeted["outsider_count"] < 20
+    assert targeted["outsider_anchor_pair_count"] == diagnostics["pairs_considered"]
+    assert targeted["scheduled_outsider_anchor_pair_count"] == 12
+    assert targeted["budget_tradeoffs"]["targeted_pool_item_rate_vs_expanded"] < 1
+    assert expanded_reference["targeted_pool_item_delta"] < 0
+    assert targeted["uses_future_labels_for_scheduling"] is False
+    assert diagnostics["coverage"]["targeted_outsider_anchor_pairs"] == 12
+    assert summary["blocker"]["status"] == "blocked_on_paid_pairwise_labels"
+    assert not (tmp_path / "targeted" / "ledger.jsonl").exists()
+
+
 def test_scheduler_only_sequential_evsi_paid_resume_reveals_followup_labels(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

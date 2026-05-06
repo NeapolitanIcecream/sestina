@@ -4,11 +4,13 @@ from sestina.evsi_scheduler import (
     CCTDGFSchedulerConfig,
     EVSISchedulerConfig,
     SequentialEVSISchedulerConfig,
+    TargetedOutsiderSchedulerConfig,
     schedule_cache_aware_cctd_gf,
     posterior_top_k_predictions,
     schedule_cache_aware_sequential_evsi,
     schedule_evsi_boundary_duels,
     schedule_exact_pool_random,
+    schedule_targeted_outsider_random,
 )
 from sestina.models import PairwiseComparison, PairwiseOrderMetadata
 from sestina.scheduler import PairwiseBudget
@@ -170,6 +172,83 @@ def test_exact_pool_random_samples_from_same_evsi_feasible_pool(
     assert random_schedule.diagnostics["evsi_score_distribution"][
         "zero_score_rate"
     ] >= 0.0
+
+
+def test_targeted_outsider_random_builds_compact_anchor_challenger_pool(
+    paper_set,
+) -> None:
+    papers = paper_set(24)
+    prior_comparisons = [
+        PairwiseComparison(
+            left_id="p1",
+            right_id="p2",
+            winner="left",
+            order=PairwiseOrderMetadata(seed=1),
+        )
+    ]
+    budget = PairwiseBudget(n=len(papers), candidate_size=12, budget=10)
+
+    schedule = schedule_targeted_outsider_random(
+        papers,
+        prior_comparisons,
+        k=4,
+        budget=budget,
+        seed=23,
+        config=TargetedOutsiderSchedulerConfig(
+            evsi=EVSISchedulerConfig(samples=500, per_item_cap=4),
+            min_outsiders=6,
+        ),
+    )
+
+    diagnostics = schedule.diagnostics["targeted_outsider"]
+    expanded_reference = diagnostics["pool_reference_deltas"]["expanded_pool"]
+    keys = {frozenset((pair.left_id, pair.right_id)) for pair in schedule.pairs}
+    assert frozenset(("p1", "p2")) not in keys
+    assert len(schedule.pairs) == budget.budget
+    assert schedule.diagnostics["acquisition"]["method"] == (
+        "targeted_outsider_random"
+    )
+    assert schedule.diagnostics["acquisition"]["selection_policy"] == (
+        "random_within_constructed_anchor_outsider_pairs"
+    )
+    assert diagnostics["anchor_count"] >= 4
+    assert diagnostics["outsider_count"] >= 6
+    assert diagnostics["outsider_anchor_pair_count"] == (
+        schedule.diagnostics["pairs_considered"]
+    )
+    assert diagnostics["budget_tradeoffs"]["targeted_pool_item_rate_vs_expanded"] < 1
+    assert expanded_reference["targeted_pool_item_delta"] < 0
+    assert diagnostics["uses_future_labels_for_scheduling"] is False
+    assert schedule.diagnostics["coverage"]["targeted_outsider_anchor_pairs"] == (
+        budget.budget
+    )
+    assert all(
+        pair.diagnostics["pair_role"] == "targeted_outsider_anchor"
+        for pair in schedule.pairs
+    )
+    assert all(
+        pair.diagnostics["source_evsi_purpose"] == "targeted_outsider_anchor"
+        for pair in schedule.pairs
+    )
+
+
+def test_targeted_outsider_random_empty_budget_reports_diagnostics(
+    paper_set,
+) -> None:
+    schedule = schedule_targeted_outsider_random(
+        paper_set(3),
+        [],
+        k=1,
+        budget=PairwiseBudget(n=3, candidate_size=3, budget=0),
+    )
+
+    assert schedule.pairs == []
+    assert schedule.diagnostics["scheduled_total"] == 0
+    assert schedule.diagnostics["acquisition"]["method"] == (
+        "targeted_outsider_random"
+    )
+    assert schedule.diagnostics["targeted_outsider"]["anchor_count"] == 0
+    assert schedule.diagnostics["targeted_outsider"]["outsider_anchor_pair_count"] == 0
 
 
 def test_sequential_evsi_reveals_cached_labels_only_after_batch_selection(

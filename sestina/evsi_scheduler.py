@@ -62,6 +62,18 @@ class CCTDGFSchedulerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class TargetedOutsiderSchedulerConfig:
+    evsi: EVSISchedulerConfig = field(
+        default_factory=lambda: EVSISchedulerConfig(samples=1200)
+    )
+    top_k_anchor_multiplier: int = 1
+    boundary_anchor_multiplier: int = 1
+    outsider_multiplier: int = 2
+    min_outsiders: int = 8
+    max_outsiders: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _PosteriorItem:
     paper_id: str
     mean: float
@@ -90,6 +102,19 @@ class _EVSIContext:
     items: list[_PosteriorItem]
     pool: list[_PosteriorItem]
     proposals: list[_AcquisitionProposal]
+
+
+@dataclass(frozen=True, slots=True)
+class _TargetedOutsiderConstruction:
+    anchors: list[_PosteriorItem]
+    anchor_roles: dict[str, list[str]]
+    outsiders: list[_PosteriorItem]
+    outsider_scores: dict[str, dict[str, float | int]]
+    proposals: list[_AcquisitionProposal]
+    exact_pool: list[_PosteriorItem]
+    exact_proposals: list[_AcquisitionProposal]
+    expanded_pool: list[_PosteriorItem]
+    expanded_proposals: list[_AcquisitionProposal]
 
 
 def posterior_top_k_predictions(
@@ -231,19 +256,91 @@ def schedule_exact_pool_random(
 ) -> PairSchedule:
     """Randomly sample from the exact feasible EVSI proposal pool."""
     cfg = config or EVSISchedulerConfig()
+    return _schedule_random_evsi_pool(
+        papers,
+        comparisons,
+        k=k,
+        budget=budget,
+        seed=seed,
+        config=cfg,
+        diagnostics=diagnostics,
+        method="exact_pool_random",
+        empty_code="exact_pool_random_pair_scheduling_empty",
+        complete_code="exact_pool_random_pair_scheduling_completed",
+        empty_message="no exact-pool random comparisons scheduled",
+        complete_message="randomly sampled exact EVSI feasible proposal pool",
+    )
+
+
+def schedule_expanded_pool_random(
+    papers: list[Paper],
+    comparisons: list[PairwiseComparison],
+    *,
+    k: int,
+    budget: PairwiseBudget,
+    seed: int = 0,
+    config: EVSISchedulerConfig | None = None,
+    diagnostics: DiagnosticRecorder | None = None,
+) -> PairSchedule:
+    """Randomly sample from a wider posterior proposal pool.
+
+    This isolates candidate-construction quality from EVSI/CCTD acquisition
+    scoring by changing the dynamic pool and keeping within-pool selection
+    random.
+    """
+    cfg = config or EVSISchedulerConfig(
+        samples=1200,
+        pool_multiplier=4,
+        diverse_outsider_count=max(20, 4 * max(k, 1)),
+    )
+    return _schedule_random_evsi_pool(
+        papers,
+        comparisons,
+        k=k,
+        budget=budget,
+        seed=seed,
+        config=cfg,
+        diagnostics=diagnostics,
+        method="expanded_pool_random",
+        empty_code="expanded_pool_random_pair_scheduling_empty",
+        complete_code="expanded_pool_random_pair_scheduling_completed",
+        empty_message="no expanded-pool random comparisons scheduled",
+        complete_message="randomly sampled expanded posterior proposal pool",
+    )
+
+
+def schedule_targeted_outsider_random(
+    papers: list[Paper],
+    comparisons: list[PairwiseComparison],
+    *,
+    k: int,
+    budget: PairwiseBudget,
+    seed: int = 0,
+    config: TargetedOutsiderSchedulerConfig | None = None,
+    diagnostics: DiagnosticRecorder | None = None,
+) -> PairSchedule:
+    """Randomly sample anchor-vs-outsider challengers from a targeted pool."""
+    cfg = config or TargetedOutsiderSchedulerConfig()
+    evsi_cfg = cfg.evsi
     recorder = diagnostics or DiagnosticRecorder()
     paper_by_id = {paper.paper_id: paper for paper in papers}
     if budget.budget <= 0 or len(paper_by_id) < 2 or k <= 0:
         payload = _empty_schedule_diagnostics(
             k=k,
             budget=budget.budget,
-            method="exact_pool_random",
+            method="targeted_outsider_random",
         )
-        payload["acquisition"]["source_method"] = "top_k_evsi_approximation"
+        payload["acquisition"].update(
+            _targeted_outsider_acquisition_payload(
+                config=cfg,
+                seed=seed,
+            )
+        )
+        payload["targeted_outsider"] = _empty_targeted_outsider_diagnostics()
         recorder.record(
             step="pair_scheduling",
-            code="exact_pool_random_pair_scheduling_empty",
-            message="no exact-pool random comparisons scheduled",
+            code="targeted_outsider_random_pair_scheduling_empty",
+            message="no targeted outsider random comparisons scheduled",
             data=payload,
         )
         return PairSchedule(pairs=[], budget=budget, diagnostics=payload)
@@ -257,7 +354,147 @@ def schedule_exact_pool_random(
         comparisons=comparisons,
         k=k,
         seed=seed,
+        config=evsi_cfg,
+        seen_pairs=seen_pairs,
+        diagnostics=recorder,
+    )
+    construction = _targeted_outsider_construction(
+        context,
+        paper_by_id=paper_by_id,
+        comparisons=comparisons,
+        seen_pairs=seen_pairs,
+        k=k,
         config=cfg,
+    )
+    scheduled = _select_random_evsi_pairs(
+        construction.proposals,
+        budget=budget.budget,
+        seed=seed,
+        per_item_cap=evsi_cfg.per_item_cap,
+        purpose_override="targeted_outsider_random",
+    )
+    targeted_pool = _ordered_unique(construction.anchors, construction.outsiders)
+    payload = {
+        "candidate_count": len(targeted_pool),
+        "scheduled_total": len(scheduled),
+        "pairs_considered": len(construction.proposals),
+        "unique_pairs_considered": len(
+            {
+                _pair_key(proposal.left_id, proposal.right_id)
+                for proposal in construction.proposals
+            }
+        ),
+        "budget": budget.budget,
+        "k": k,
+        "posterior": {
+            "samples": context.posterior.samples,
+            "average_top_k_probability": context.posterior.diagnostics.get(
+                "average_top_k_probability"
+            ),
+        },
+        "acquisition": _targeted_outsider_acquisition_payload(
+            config=cfg,
+            seed=seed,
+        ),
+        "purpose_counts": dict(
+            sorted(Counter(pair.purpose for pair in scheduled).items())
+        ),
+        "coverage": {
+            **_evsi_coverage(
+                scheduled,
+                item_by_id={item.paper_id: item for item in context.items},
+            ),
+            **_targeted_outsider_coverage(
+                scheduled,
+                anchor_ids={item.paper_id for item in construction.anchors},
+                outsider_ids={item.paper_id for item in construction.outsiders},
+            ),
+        },
+        "proposal_pool_profile": _proposal_pool_profile(
+            items=context.items,
+            pool=targeted_pool,
+            scheduled=scheduled,
+            k=k,
+        ),
+        "targeted_outsider": _targeted_outsider_diagnostics(
+            construction,
+            scheduled=scheduled,
+            budget=budget.budget,
+            k=k,
+        ),
+        "evsi_score_distribution": _evsi_score_distribution(construction.proposals),
+        "batch_history": [
+            {
+                "batch_index": 1,
+                "selected_total": len(scheduled),
+                "cached_label_revealed_total": 0,
+                "novel_pairs_total": 0,
+                "top_k_entropy_reduction": None,
+                "top_k_set_churn": None,
+                "note": (
+                    "targeted outsider random schedules one offline batch "
+                    "without label reveal"
+                ),
+            }
+        ],
+    }
+    recorder.record(
+        step="pair_scheduling",
+        code="targeted_outsider_random_pair_scheduling_completed",
+        message="randomly sampled targeted outsider-anchor proposal pool",
+        data=payload,
+    )
+    return PairSchedule(pairs=scheduled, budget=budget, diagnostics=payload)
+
+
+def _schedule_random_evsi_pool(
+    papers: list[Paper],
+    comparisons: list[PairwiseComparison],
+    *,
+    k: int,
+    budget: PairwiseBudget,
+    seed: int,
+    config: EVSISchedulerConfig,
+    diagnostics: DiagnosticRecorder | None,
+    method: str,
+    empty_code: str,
+    complete_code: str,
+    empty_message: str,
+    complete_message: str,
+) -> PairSchedule:
+    recorder = diagnostics or DiagnosticRecorder()
+    paper_by_id = {paper.paper_id: paper for paper in papers}
+    if budget.budget <= 0 or len(paper_by_id) < 2 or k <= 0:
+        payload = _empty_schedule_diagnostics(
+            k=k,
+            budget=budget.budget,
+            method=method,
+        )
+        payload["acquisition"].update(
+            _random_pool_acquisition_payload(
+                method=method,
+                seed=seed,
+                config=config,
+            )
+        )
+        recorder.record(
+            step="pair_scheduling",
+            code=empty_code,
+            message=empty_message,
+            data=payload,
+        )
+        return PairSchedule(pairs=[], budget=budget, diagnostics=payload)
+
+    seen_pairs = {
+        _pair_key(comparison.left_id, comparison.right_id)
+        for comparison in comparisons
+    }
+    context = _build_evsi_context(
+        papers,
+        comparisons=comparisons,
+        k=k,
+        seed=seed,
+        config=config,
         seen_pairs=seen_pairs,
         diagnostics=recorder,
     )
@@ -265,7 +502,8 @@ def schedule_exact_pool_random(
         context.proposals,
         budget=budget.budget,
         seed=seed,
-        per_item_cap=cfg.per_item_cap,
+        per_item_cap=config.per_item_cap,
+        purpose_override=method,
     )
     payload = {
         "candidate_count": len(context.pool),
@@ -285,13 +523,11 @@ def schedule_exact_pool_random(
                 "average_top_k_probability"
             ),
         },
-        "acquisition": {
-            "method": "exact_pool_random",
-            "source_method": "top_k_evsi_approximation",
-            "random_seed": seed,
-            "per_item_cap": cfg.per_item_cap,
-            "pool_multiplier": cfg.pool_multiplier,
-        },
+        "acquisition": _random_pool_acquisition_payload(
+            method=method,
+            seed=seed,
+            config=config,
+        ),
         "purpose_counts": dict(
             sorted(Counter(pair.purpose for pair in scheduled).items())
         ),
@@ -314,17 +550,103 @@ def schedule_exact_pool_random(
                 "novel_pairs_total": 0,
                 "top_k_entropy_reduction": None,
                 "top_k_set_churn": None,
-                "note": "random control schedules one offline batch without label reveal",
+                "note": (
+                    "random control schedules one offline batch without "
+                    "label reveal"
+                ),
             }
         ],
     }
     recorder.record(
         step="pair_scheduling",
-        code="exact_pool_random_pair_scheduling_completed",
-        message="randomly sampled exact EVSI feasible proposal pool",
+        code=complete_code,
+        message=complete_message,
         data=payload,
     )
     return PairSchedule(pairs=scheduled, budget=budget, diagnostics=payload)
+
+
+def _random_pool_acquisition_payload(
+    *,
+    method: str,
+    seed: int,
+    config: EVSISchedulerConfig,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "method": method,
+        "source_method": "top_k_evsi_approximation",
+        "random_seed": seed,
+        "per_item_cap": config.per_item_cap,
+        "pool_multiplier": config.pool_multiplier,
+        "diverse_outsider_count": config.diverse_outsider_count,
+    }
+    if method == "expanded_pool_random":
+        payload["candidate_construction_change"] = "expanded_dynamic_proposal_pool"
+    return payload
+
+
+def _targeted_outsider_acquisition_payload(
+    *,
+    config: TargetedOutsiderSchedulerConfig,
+    seed: int,
+) -> dict[str, Any]:
+    return {
+        "method": "targeted_outsider_random",
+        "source_method": "posterior_anchor_targeted_outsider_construction",
+        "selection_policy": "random_within_constructed_anchor_outsider_pairs",
+        "random_seed": seed,
+        "posterior_samples": config.evsi.samples,
+        "per_item_cap": config.evsi.per_item_cap,
+        "top_k_anchor_multiplier": config.top_k_anchor_multiplier,
+        "boundary_anchor_multiplier": config.boundary_anchor_multiplier,
+        "outsider_multiplier": config.outsider_multiplier,
+        "min_outsiders": config.min_outsiders,
+        "max_outsiders": config.max_outsiders,
+        "candidate_construction_change": "targeted_outsider_anchor_challengers",
+        "model_visible_signals": [
+            "posterior_top_k_probability",
+            "posterior_boundary_mass",
+            "posterior_ucb",
+            "posterior_uncertainty",
+            "metadata_bucket_diversity",
+            "prior_pairwise_degree",
+        ],
+    }
+
+
+def _empty_targeted_outsider_diagnostics() -> dict[str, Any]:
+    return {
+        "anchor_count": 0,
+        "top_k_anchor_count": 0,
+        "boundary_anchor_count": 0,
+        "outsider_count": 0,
+        "outsider_anchor_pair_count": 0,
+        "scheduled_outsider_anchor_pair_count": 0,
+        "scheduled_anchor_count": 0,
+        "scheduled_outsider_count": 0,
+        "pool_reference_deltas": {
+            "exact_pool": {
+                "pool_item_count": 0,
+                "proposal_count": 0,
+                "targeted_pool_item_delta": 0,
+                "targeted_proposal_delta": 0,
+            },
+            "expanded_pool": {
+                "pool_item_count": 0,
+                "proposal_count": 0,
+                "targeted_pool_item_delta": 0,
+                "targeted_proposal_delta": 0,
+            },
+        },
+        "budget_tradeoffs": {
+            "scheduled_pairs": 0,
+            "scheduled_unique_papers": 0,
+            "anchor_outsider_pair_rate": 0.0,
+            "scheduled_unique_papers_per_pair": 0.0,
+            "anchor_touch_rate": 0.0,
+            "outsider_touch_rate": 0.0,
+        },
+    }
 
 
 def schedule_cache_aware_sequential_evsi(
@@ -909,6 +1231,302 @@ def _dynamic_proposal_pool(
     return _ordered_unique(selected)
 
 
+def _targeted_outsider_construction(
+    context: _EVSIContext,
+    *,
+    paper_by_id: dict[str, Paper],
+    comparisons: list[PairwiseComparison],
+    seen_pairs: set[tuple[str, str]],
+    k: int,
+    config: TargetedOutsiderSchedulerConfig,
+) -> _TargetedOutsiderConstruction:
+    exact_config = EVSISchedulerConfig(
+        pairwise_strength=config.evsi.pairwise_strength,
+        samples=config.evsi.samples,
+        temperature=config.evsi.temperature,
+        ucb_lambda=config.evsi.ucb_lambda,
+        boundary_window=config.evsi.boundary_window,
+        pool_multiplier=2,
+        diverse_outsider_count=None,
+        calibration_fraction=config.evsi.calibration_fraction,
+        per_item_cap=config.evsi.per_item_cap,
+    )
+    expanded_config = EVSISchedulerConfig(
+        pairwise_strength=config.evsi.pairwise_strength,
+        samples=config.evsi.samples,
+        temperature=config.evsi.temperature,
+        ucb_lambda=config.evsi.ucb_lambda,
+        boundary_window=config.evsi.boundary_window,
+        pool_multiplier=4,
+        diverse_outsider_count=max(20, 4 * max(k, 1)),
+        calibration_fraction=config.evsi.calibration_fraction,
+        per_item_cap=config.evsi.per_item_cap,
+    )
+    exact_pool = _dynamic_proposal_pool(context.items, k=k, config=exact_config)
+    exact_proposals = _evsi_proposals(
+        exact_pool,
+        paper_by_id=paper_by_id,
+        seen_pairs=seen_pairs,
+        config=exact_config,
+    )
+    expanded_pool = _dynamic_proposal_pool(
+        context.items,
+        k=k,
+        config=expanded_config,
+    )
+    expanded_proposals = _evsi_proposals(
+        expanded_pool,
+        paper_by_id=paper_by_id,
+        seen_pairs=seen_pairs,
+        config=expanded_config,
+    )
+    anchors, anchor_roles = _targeted_anchor_items(
+        context.items,
+        k=k,
+        config=config,
+    )
+    outsiders, outsider_scores = _targeted_outsider_items(
+        context.items,
+        anchors=anchors,
+        comparisons=comparisons,
+        k=k,
+        config=config,
+    )
+    proposals = _targeted_outsider_proposals(
+        anchors=anchors,
+        anchor_roles=anchor_roles,
+        outsiders=outsiders,
+        outsider_scores=outsider_scores,
+        paper_by_id=paper_by_id,
+        seen_pairs=seen_pairs,
+        config=config.evsi,
+    )
+    return _TargetedOutsiderConstruction(
+        anchors=anchors,
+        anchor_roles=anchor_roles,
+        outsiders=outsiders,
+        outsider_scores=outsider_scores,
+        proposals=proposals,
+        exact_pool=exact_pool,
+        exact_proposals=exact_proposals,
+        expanded_pool=expanded_pool,
+        expanded_proposals=expanded_proposals,
+    )
+
+
+def _targeted_anchor_items(
+    items: list[_PosteriorItem],
+    *,
+    k: int,
+    config: TargetedOutsiderSchedulerConfig,
+) -> tuple[list[_PosteriorItem], dict[str, list[str]]]:
+    if not items or k <= 0:
+        return [], {}
+    top_count = max(1, config.top_k_anchor_multiplier * max(k, 1))
+    boundary_count = max(1, config.boundary_anchor_multiplier * max(k, 1))
+    target_count = min(len(items), top_count + boundary_count)
+    by_top_k = sorted(
+        items,
+        key=lambda item: (item.top_k_probability, item.mean, item.paper_id),
+        reverse=True,
+    )
+    by_boundary = sorted(
+        items,
+        key=lambda item: (item.boundary_mass, item.top_k_probability, item.paper_id),
+        reverse=True,
+    )
+    roles: dict[str, set[str]] = {}
+    for item in by_top_k[:top_count]:
+        roles.setdefault(item.paper_id, set()).add("posterior_top_k")
+    for item in by_boundary[:boundary_count]:
+        roles.setdefault(item.paper_id, set()).add("boundary")
+    anchors = _ordered_unique(
+        by_top_k[:top_count],
+        by_boundary[:boundary_count],
+    )
+    if len(anchors) < target_count:
+        filler = _ordered_unique(
+            sorted(
+                items,
+                key=lambda item: (item.ucb, item.top_k_probability, item.paper_id),
+                reverse=True,
+            )
+        )
+        for item in filler:
+            if len(anchors) >= target_count:
+                break
+            if item.paper_id in {anchor.paper_id for anchor in anchors}:
+                continue
+            anchors.append(item)
+            roles.setdefault(item.paper_id, set()).add("ucb_fill")
+    return anchors[:target_count], {
+        paper_id: sorted(values) for paper_id, values in sorted(roles.items())
+    }
+
+
+def _targeted_outsider_items(
+    items: list[_PosteriorItem],
+    *,
+    anchors: list[_PosteriorItem],
+    comparisons: list[PairwiseComparison],
+    k: int,
+    config: TargetedOutsiderSchedulerConfig,
+) -> tuple[list[_PosteriorItem], dict[str, dict[str, float | int]]]:
+    anchor_ids = {item.paper_id for item in anchors}
+    candidates = [item for item in items if item.paper_id not in anchor_ids]
+    if not candidates:
+        return [], {}
+    target_count = min(
+        len(candidates),
+        max(config.min_outsiders, config.outsider_multiplier * max(k, 1)),
+    )
+    if config.max_outsiders is not None:
+        target_count = min(target_count, config.max_outsiders)
+    prior_degrees = _prior_pairwise_degrees(comparisons)
+    anchor_buckets = {item.metadata_bucket for item in anchors}
+    top_k_scores = _rank_scores(
+        candidates,
+        key=lambda item: (item.top_k_probability, item.mean),
+    )
+    ucb_scores = _rank_scores(
+        candidates,
+        key=lambda item: (item.ucb, item.top_k_probability),
+    )
+    uncertainty_scores = _rank_scores(
+        candidates,
+        key=lambda item: (item.sigma, item.ucb),
+    )
+    boundary_scores = _rank_scores(
+        candidates,
+        key=lambda item: (item.boundary_mass, item.top_k_probability),
+    )
+    scored: list[tuple[float, _PosteriorItem, dict[str, float | int]]] = []
+    for item in candidates:
+        metadata_diversity = (
+            _rate(
+                sum(1 for bucket in anchor_buckets if bucket != item.metadata_bucket),
+                len(anchor_buckets),
+            )
+            if anchor_buckets
+            else 0.0
+        )
+        prior_degree = prior_degrees[item.paper_id]
+        exposure_score = 1.0 / (1.0 + prior_degree)
+        score = (
+            (0.30 * top_k_scores[item.paper_id])
+            + (0.25 * ucb_scores[item.paper_id])
+            + (0.20 * uncertainty_scores[item.paper_id])
+            + (0.15 * boundary_scores[item.paper_id])
+            + (0.05 * metadata_diversity)
+            + (0.05 * exposure_score)
+        )
+        diagnostics: dict[str, float | int] = {
+            "outsider_construction_score": round(score, 8),
+            "outsider_top_k_rank_score": round(top_k_scores[item.paper_id], 8),
+            "outsider_ucb_rank_score": round(ucb_scores[item.paper_id], 8),
+            "outsider_uncertainty_rank_score": round(
+                uncertainty_scores[item.paper_id],
+                8,
+            ),
+            "outsider_boundary_rank_score": round(boundary_scores[item.paper_id], 8),
+            "outsider_metadata_diversity": round(metadata_diversity, 8),
+            "outsider_prior_pairwise_degree": int(prior_degree),
+            "outsider_prior_exposure_score": round(exposure_score, 8),
+        }
+        scored.append((score, item, diagnostics))
+    scored.sort(
+        key=lambda row: (
+            row[0],
+            row[1].ucb,
+            row[1].top_k_probability,
+            row[1].paper_id,
+        ),
+        reverse=True,
+    )
+    selected = _diverse_prefix([item for _, item, _ in scored], limit=target_count)
+    selected_ids = {item.paper_id for item in selected}
+    scores_by_id = {
+        item.paper_id: diagnostics
+        for _, item, diagnostics in scored
+        if item.paper_id in selected_ids
+    }
+    return selected, scores_by_id
+
+
+def _targeted_outsider_proposals(
+    *,
+    anchors: list[_PosteriorItem],
+    anchor_roles: dict[str, list[str]],
+    outsiders: list[_PosteriorItem],
+    outsider_scores: dict[str, dict[str, float | int]],
+    paper_by_id: dict[str, Paper],
+    seen_pairs: set[tuple[str, str]],
+    config: EVSISchedulerConfig,
+) -> list[_AcquisitionProposal]:
+    proposals: list[_AcquisitionProposal] = []
+    for anchor in anchors:
+        for outsider in outsiders:
+            key = _pair_key(anchor.paper_id, outsider.paper_id)
+            if key in seen_pairs:
+                continue
+            probability = _sigmoid(
+                (anchor.mean - outsider.mean) / max(config.temperature, 1e-9)
+            )
+            entropy = _binary_entropy(probability)
+            boundary_relevance = anchor.boundary_mass + outsider.boundary_mass
+            metadata_diverse = anchor.metadata_bucket != outsider.metadata_bucket
+            outsider_payload = outsider_scores.get(outsider.paper_id, {})
+            score = float(
+                outsider_payload.get("outsider_construction_score", 0.0)
+            ) * (0.5 + min(1.0, boundary_relevance / 2.0))
+            if metadata_diverse:
+                score *= 1.05
+            proposals.append(
+                _AcquisitionProposal(
+                    left_id=anchor.paper_id,
+                    right_id=outsider.paper_id,
+                    score=score,
+                    purpose="targeted_outsider_anchor",
+                    diagnostics={
+                        "acquisition_score": round(score, 8),
+                        "construction_score": round(score, 8),
+                        "head_to_head_probability": round(probability, 8),
+                        "head_to_head_entropy": round(entropy, 8),
+                        "boundary_relevance": round(boundary_relevance, 8),
+                        "pair_role": "targeted_outsider_anchor",
+                        "metadata_diverse": metadata_diverse,
+                        "anchor_id": anchor.paper_id,
+                        "outsider_id": outsider.paper_id,
+                        "anchor_roles": anchor_roles.get(anchor.paper_id, []),
+                        "anchor_top_k_probability": round(
+                            anchor.top_k_probability,
+                            8,
+                        ),
+                        "outsider_top_k_probability": round(
+                            outsider.top_k_probability,
+                            8,
+                        ),
+                        "anchor_ucb": round(anchor.ucb, 8),
+                        "outsider_ucb": round(outsider.ucb, 8),
+                        "anchor_mean_rank": round(anchor.mean_rank, 8),
+                        "outsider_mean_rank": round(outsider.mean_rank, 8),
+                        "anchor_boundary_mass": round(anchor.boundary_mass, 8),
+                        "outsider_boundary_mass": round(outsider.boundary_mass, 8),
+                        "anchor_metadata_bucket": anchor.metadata_bucket,
+                        "outsider_metadata_bucket": outsider.metadata_bucket,
+                        "anchor_title": paper_by_id[anchor.paper_id].title,
+                        "outsider_title": paper_by_id[outsider.paper_id].title,
+                        **outsider_payload,
+                    },
+                )
+            )
+    return sorted(
+        proposals,
+        key=lambda proposal: (proposal.score, proposal.left_id, proposal.right_id),
+        reverse=True,
+    )
+
+
 def _evsi_proposals(
     pool: list[_PosteriorItem],
     *,
@@ -1064,6 +1682,7 @@ def _select_random_evsi_pairs(
     budget: int,
     seed: int,
     per_item_cap: int | None,
+    purpose_override: str = "exact_pool_random",
 ) -> list[ScheduledPair]:
     if budget <= 0:
         return []
@@ -1103,7 +1722,7 @@ def _select_random_evsi_pairs(
     return _scheduled_pairs_from_proposals(
         selected[:budget],
         seed=seed,
-        purpose_override="exact_pool_random",
+        purpose_override=purpose_override,
         priority_override=0.0,
         source_purpose_key="source_evsi_purpose",
     )
@@ -1821,6 +2440,193 @@ def _cctd_graph_coverage(scheduled: list[ScheduledPair]) -> dict[str, Any]:
             / len(scheduled),
             8,
         ),
+    }
+
+
+def _targeted_outsider_coverage(
+    scheduled: list[ScheduledPair],
+    *,
+    anchor_ids: set[str],
+    outsider_ids: set[str],
+) -> dict[str, Any]:
+    touched = {
+        paper_id
+        for pair in scheduled
+        for paper_id in (pair.left_id, pair.right_id)
+    }
+    scheduled_anchor_ids = touched & anchor_ids
+    scheduled_outsider_ids = touched & outsider_ids
+    outsider_anchor_pairs = sum(
+        1
+        for pair in scheduled
+        if (
+            (pair.left_id in anchor_ids and pair.right_id in outsider_ids)
+            or (pair.right_id in anchor_ids and pair.left_id in outsider_ids)
+        )
+    )
+    return {
+        "targeted_outsider_anchor_pairs": outsider_anchor_pairs,
+        "targeted_outsider_anchor_pair_rate": _rate(
+            outsider_anchor_pairs,
+            len(scheduled),
+        ),
+        "targeted_anchor_count": len(anchor_ids),
+        "targeted_outsider_count": len(outsider_ids),
+        "scheduled_targeted_anchor_count": len(scheduled_anchor_ids),
+        "scheduled_targeted_outsider_count": len(scheduled_outsider_ids),
+        "targeted_anchor_touch_rate": _rate(
+            len(scheduled_anchor_ids),
+            len(anchor_ids),
+        ),
+        "targeted_outsider_touch_rate": _rate(
+            len(scheduled_outsider_ids),
+            len(outsider_ids),
+        ),
+    }
+
+
+def _targeted_outsider_diagnostics(
+    construction: _TargetedOutsiderConstruction,
+    *,
+    scheduled: list[ScheduledPair],
+    budget: int,
+    k: int,
+) -> dict[str, Any]:
+    targeted_pool = _ordered_unique(construction.anchors, construction.outsiders)
+    anchor_ids = {item.paper_id for item in construction.anchors}
+    outsider_ids = {item.paper_id for item in construction.outsiders}
+    touched = {
+        paper_id
+        for pair in scheduled
+        for paper_id in (pair.left_id, pair.right_id)
+    }
+    scheduled_outsider_anchor_pairs = sum(
+        1
+        for pair in scheduled
+        if (
+            (pair.left_id in anchor_ids and pair.right_id in outsider_ids)
+            or (pair.right_id in anchor_ids and pair.left_id in outsider_ids)
+        )
+    )
+    anchor_role_counts = Counter(
+        role
+        for roles in construction.anchor_roles.values()
+        for role in roles
+    )
+    outsider_scores = [
+        float(payload.get("outsider_construction_score", 0.0))
+        for payload in construction.outsider_scores.values()
+    ]
+    return {
+        "anchor_count": len(construction.anchors),
+        "top_k_anchor_count": int(anchor_role_counts.get("posterior_top_k", 0)),
+        "boundary_anchor_count": int(anchor_role_counts.get("boundary", 0)),
+        "anchor_role_counts": dict(sorted(anchor_role_counts.items())),
+        "outsider_count": len(construction.outsiders),
+        "outsider_target_formula": (
+            "min(available_non_anchor, max(min_outsiders, outsider_multiplier*K))"
+        ),
+        "k": k,
+        "outsider_anchor_pair_count": len(construction.proposals),
+        "scheduled_outsider_anchor_pair_count": scheduled_outsider_anchor_pairs,
+        "scheduled_anchor_count": len(touched & anchor_ids),
+        "scheduled_outsider_count": len(touched & outsider_ids),
+        "metadata_bucket_counts": {
+            "anchors": dict(
+                sorted(Counter(item.metadata_bucket for item in construction.anchors).items())
+            ),
+            "outsiders": dict(
+                sorted(Counter(item.metadata_bucket for item in construction.outsiders).items())
+            ),
+        },
+        "outsider_score_distribution": _numeric_distribution(outsider_scores),
+        "pool_reference_deltas": {
+            "exact_pool": {
+                "pool_item_count": len(construction.exact_pool),
+                "proposal_count": len(construction.exact_proposals),
+                "targeted_pool_item_delta": (
+                    len(targeted_pool) - len(construction.exact_pool)
+                ),
+                "targeted_proposal_delta": (
+                    len(construction.proposals) - len(construction.exact_proposals)
+                ),
+            },
+            "expanded_pool": {
+                "pool_item_count": len(construction.expanded_pool),
+                "proposal_count": len(construction.expanded_proposals),
+                "targeted_pool_item_delta": (
+                    len(targeted_pool) - len(construction.expanded_pool)
+                ),
+                "targeted_proposal_delta": (
+                    len(construction.proposals) - len(construction.expanded_proposals)
+                ),
+            },
+        },
+        "budget_tradeoffs": {
+            "scheduled_pairs": len(scheduled),
+            "budget": budget,
+            "budget_utilization": _rate(len(scheduled), budget),
+            "scheduled_unique_papers": len(touched),
+            "scheduled_unique_papers_per_pair": _rate(len(touched), len(scheduled)),
+            "anchor_outsider_pair_rate": _rate(
+                scheduled_outsider_anchor_pairs,
+                len(scheduled),
+            ),
+            "anchor_touch_rate": _rate(len(touched & anchor_ids), len(anchor_ids)),
+            "outsider_touch_rate": _rate(
+                len(touched & outsider_ids),
+                len(outsider_ids),
+            ),
+            "targeted_pool_item_count": len(targeted_pool),
+            "targeted_pool_item_rate_vs_expanded": _rate(
+                len(targeted_pool),
+                len(construction.expanded_pool),
+            ),
+        },
+        "uses_future_labels_for_scheduling": False,
+    }
+
+
+def _prior_pairwise_degrees(
+    comparisons: list[PairwiseComparison],
+) -> Counter[str]:
+    degrees: Counter[str] = Counter()
+    for comparison in comparisons:
+        degrees[comparison.left_id] += 1
+        degrees[comparison.right_id] += 1
+    return degrees
+
+
+def _rank_scores(
+    items: list[_PosteriorItem],
+    *,
+    key: Callable[[_PosteriorItem], tuple[float, ...]],
+) -> dict[str, float]:
+    if not items:
+        return {}
+    if len(items) == 1:
+        return {items[0].paper_id: 1.0}
+    ranked = sorted(items, key=key, reverse=True)
+    denominator = max(1, len(ranked) - 1)
+    return {
+        item.paper_id: round(1.0 - (index / denominator), 8)
+        for index, item in enumerate(ranked)
+    }
+
+
+def _numeric_distribution(values: list[float]) -> dict[str, float | int]:
+    if not values:
+        return {
+            "count": 0,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+        }
+    return {
+        "count": len(values),
+        "min": round(min(values), 8),
+        "max": round(max(values), 8),
+        "mean": round(sum(values) / len(values), 8),
     }
 
 

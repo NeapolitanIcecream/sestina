@@ -78,6 +78,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "quota",
             "evsi",
             "exact_pool_random",
+            "expanded_pool_random",
+            "targeted_outsider_random",
             "sequential_evsi",
             "cctd_gf",
         ],

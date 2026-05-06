@@ -48,7 +48,9 @@ from sestina.evsi_scheduler import (
     schedule_cache_aware_cctd_gf,
     schedule_cache_aware_sequential_evsi,
     schedule_evsi_boundary_duels,
+    schedule_expanded_pool_random,
     schedule_exact_pool_random,
+    schedule_targeted_outsider_random,
 )
 from sestina.models import (
     PairwiseComparison,
@@ -536,6 +538,24 @@ def build_scheduler_only_bucket_plan(
             seed=seed,
             diagnostics=diagnostics,
             config=EVSISchedulerConfig(samples=1200),
+        )
+    elif scheduler_kind == "expanded_pool_random":
+        schedule = schedule_expanded_pool_random(
+            papers,
+            [],
+            k=bucket.k,
+            budget=budget,
+            seed=seed,
+            diagnostics=diagnostics,
+        )
+    elif scheduler_kind == "targeted_outsider_random":
+        schedule = schedule_targeted_outsider_random(
+            papers,
+            [],
+            k=bucket.k,
+            budget=budget,
+            seed=seed,
+            diagnostics=diagnostics,
         )
     elif scheduler_kind in {"sequential_evsi", "cctd_gf"}:
         reusable, reusable_stats = load_historical_pairwise_reuse_cache(
