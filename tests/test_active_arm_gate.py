@@ -273,6 +273,73 @@ def test_gate_blocks_when_paired_metric_deltas_are_incomplete() -> None:
     ) in payload["gate_verdict"]["blocking_reasons"]
 
 
+def test_gate_blocks_future_label_or_cached_label_leakage_markers() -> None:
+    """Future labels and cached label values cannot inform scheduling."""
+    payload = build_active_arm_gate(
+        _active_artifact(
+            recall_deltas=[0.01] * 20,
+            ndcg_deltas=[0.0] * 20,
+            ap_deltas=[0.0] * 20,
+            leakage_policy={
+                "future_labels_used_for_scheduling": True,
+                "uses_future_labels_for_scheduling": True,
+                "cached_label_values_used_before_scheduling": True,
+            },
+        ),
+        _random_reference_artifact(),
+    )
+
+    assert payload["paid_followup_allowed"] is False
+    assert payload["gate_verdict"]["no_future_label_or_cached_label_leakage"] is False
+    assert payload["label_leakage"]["forbidden_true_keys"] == [
+        "cached_label_values_used_before_scheduling",
+        "future_labels_used_for_scheduling",
+        "uses_future_labels_for_scheduling",
+    ]
+    assert (
+        "future-label or cached-label leakage markers are true: "
+        "cached_label_values_used_before_scheduling, "
+        "future_labels_used_for_scheduling, "
+        "uses_future_labels_for_scheduling"
+    ) in payload["gate_verdict"]["blocking_reasons"]
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "future_labels_used_for_scheduling",
+        "uses_future_labels_for_scheduling",
+        "future_labels_used_as_model_features",
+        "future_labels_used_for_model_visible_selection",
+        "future_labels_used_in_model_visible_inputs",
+        "future_labels_used_for_prompting",
+        "future_labels_used_for_routing",
+        "future_citation_labels_used_for_scheduling",
+        "citation_labels_used_for_scheduling",
+        "citation_outcomes_used_for_scheduling",
+        "good_paper_used_for_scheduling",
+        "matched_title_used_for_scheduling",
+        "matched_work_id_used_for_scheduling",
+        "cached_label_values_used_before_scheduling",
+    ],
+)
+def test_gate_blocks_repo_emitted_label_leakage_marker_aliases(marker: str) -> None:
+    """Regression: producer-specific leakage marker aliases could pass the gate."""
+    payload = build_active_arm_gate(
+        _active_artifact(
+            recall_deltas=[0.01] * 20,
+            ndcg_deltas=[0.0] * 20,
+            ap_deltas=[0.0] * 20,
+            leakage_policy={marker: True},
+        ),
+        _random_reference_artifact(),
+    )
+
+    assert payload["paid_followup_allowed"] is False
+    assert payload["gate_verdict"]["no_future_label_or_cached_label_leakage"] is False
+    assert payload["label_leakage"]["forbidden_true_keys"] == [marker]
+
+
 def test_gate_artifact_schema_requires_diagnostics_and_verdict() -> None:
     payload = build_active_arm_gate(
         _active_artifact(
@@ -305,6 +372,7 @@ def _active_artifact(
     active_scheduled_pairwise_total: int = 20,
     random_scheduled_pairwise_total: int = 20,
     resolved_pairwise_budget: int = 20,
+    leakage_policy: dict | None = None,
 ) -> dict:
     active_arm = "active_candidate"
     seeds = [str(index + 1) for index in range(len(recall_deltas))]
@@ -422,6 +490,8 @@ def _active_artifact(
             }
         ],
     }
+    if leakage_policy is not None:
+        payload["label_policy"] = leakage_policy
     if include_paid_metadata:
         payload["paid_calls_made"] = paid_calls_made
         payload["paid_spend_usd"] = paid_spend_usd

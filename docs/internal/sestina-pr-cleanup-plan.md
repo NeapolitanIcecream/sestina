@@ -15,6 +15,9 @@ Internal-review-only cleanup package:
 `docs/internal/sestina-internal-review-package.md` and
 `artifacts/backtest-arxiv-internal-review-cleanup/internal-review-cleanup-index.json`
 
+Next experiment protocol:
+`docs/internal/sestina-next-experiment-protocol.md`
+
 ## Bottom Line
 
 The branch is ready for a PR/publication cleanup workflow, but it should not be
@@ -35,6 +38,12 @@ This does not change the artifact boundary: no raw `artifacts/**/calls/*.json`,
 ledgers/stdout JSON, planned pair manifests, dataset manifests, or
 `.codex-workflows/**` records should enter public-facing outputs without a
 separate scrub/review.
+
+2026-05-07 next-experiment protocol update: future experiment work must begin
+with a new no-paid gate and must preserve the current result as cached/no-paid,
+not fresh validation. Fresh holdout validation is dry-run/preflight-only until
+the no-paid gate passes and all provider availability, JSONL ledger, max-usd,
+zero-pointwise, no-leakage, and immutable-artifact guardrails clear.
 
 ## Current Worktree Shape
 

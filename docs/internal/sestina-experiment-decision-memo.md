@@ -16,6 +16,9 @@ Related-work audit:
 Final internal handoff:
 `docs/internal/sestina-final-results-handoff.md`
 
+Next experiment protocol:
+`docs/internal/sestina-next-experiment-protocol.md`
+
 Machine-readable consolidation:
 `artifacts/backtest-arxiv-experiment-consolidation/consolidation-summary.json`
 
@@ -159,6 +162,12 @@ more on random baselines would be lower value than improving the active-arm
 design gate.
 
 ## Hard Protocol For Future Active Arms
+
+2026-05-07 operationalization: the machine-readable gate/protocol contract now
+lives in `sestina.active_arm_gate`, `sestina.experiment_protocol`, and
+`scripts/validate_next_experiment_protocol.py`. It preserves the stop decision:
+the current best result is cached/no-paid internal evidence, not fresh
+validation.
 
 Before any paid labels:
 
