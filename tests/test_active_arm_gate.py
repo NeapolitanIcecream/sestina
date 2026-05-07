@@ -314,6 +314,8 @@ def test_gate_blocks_future_label_or_cached_label_leakage_markers() -> None:
         "future_labels_used_in_model_visible_inputs",
         "future_labels_used_for_prompting",
         "future_labels_used_for_routing",
+        "uses_future_labels_for_decision",
+        "uses_future_labels_for_calibration",
         "future_citation_labels_used_for_scheduling",
         "citation_labels_used_for_scheduling",
         "citation_outcomes_used_for_scheduling",

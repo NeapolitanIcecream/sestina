@@ -61,6 +61,28 @@ def test_protocol_blocks_inconsistent_no_paid_gate_verdict_before_holdout() -> N
     assert "no_paid_gate_passed" in holdout["blocking_reasons"]
 
 
+def test_protocol_blocks_non_gate_artifact_before_holdout() -> None:
+    """Regression: arbitrary JSON with passing fields could unlock holdout."""
+    gate = _no_paid_gate_artifact(passed=True)
+    gate["artifact_type"] = "not-a-sestina-active-arm-gate"
+
+    payload = build_next_experiment_protocol(
+        no_paid_gate_artifact=gate,
+        fresh_holdout_request=_fresh_holdout_request(),
+    )
+
+    no_paid_gate = payload["future_experiment_gate"]["no_paid_gate"]
+    holdout = payload["fresh_holdout_validation_protocol"]
+    assert no_paid_gate["passed"] is False
+    assert no_paid_gate["schema_valid"] is False
+    assert no_paid_gate["blocking_reasons"] == [
+        "no_paid_gate_artifact_schema_invalid"
+    ]
+    assert "unexpected artifact_type" in no_paid_gate["schema_error"]
+    assert holdout["allowed_to_begin"] is False
+    assert "no_paid_gate_passed" in holdout["blocking_reasons"]
+
+
 def test_protocol_allows_only_dry_run_preflight_after_hard_gate_passes() -> None:
     payload = build_next_experiment_protocol(
         no_paid_gate_artifact=_no_paid_gate_artifact(passed=True),
@@ -108,6 +130,7 @@ def _no_paid_gate_artifact(*, passed: bool) -> dict:
         "active_arm_name": "confidence_interval_top_k_partition_elimination",
         "candidate_random_control_baseline": "exact_pool_random_cached_replay",
         "paid_followup_allowed": passed,
+        "gate_policy": {},
         "gate_verdict": {
             "paid_followup_allowed": passed,
             "blocking_reasons": [] if passed else ["metric gate did not pass"],
@@ -117,6 +140,7 @@ def _no_paid_gate_artifact(*, passed: bool) -> dict:
             "randomized_floor_or_paired_control_present": True,
             "no_future_label_or_cached_label_leakage": True,
         },
+        "seed_level_confidence_intervals": {},
         "paired_active_minus_random_deltas": {
             "metric_deltas": {
                 "recall_at_k": {"count": 20, "mean": 0.03},
@@ -127,8 +151,13 @@ def _no_paid_gate_artifact(*, passed: bool) -> dict:
         "diagnostics": {
             "weak_bucket_diagnostics": {"available": True},
         },
+        "caveats": {
+            "budget_completeness_caveat": {"present": False},
+        },
+        "spend_estimate": {},
         "label_leakage": {"present": False, "forbidden_true_keys": []},
         "random_variance_reference": {"complete_20_seed_reference": True},
+        "input_artifacts": {},
     }
 
 

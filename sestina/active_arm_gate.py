@@ -62,6 +62,8 @@ FORBIDDEN_LABEL_LEAKAGE_TRUE_KEYS = {
     "future_labels_used_in_model_visible_inputs",
     "future_labels_used_for_prompting",
     "future_labels_used_for_routing",
+    "uses_future_labels_for_decision",
+    "uses_future_labels_for_calibration",
     "citation_labels_used_for_scheduling",
     "future_citation_labels_used_for_scheduling",
     "citation_outcomes_used_for_scheduling",

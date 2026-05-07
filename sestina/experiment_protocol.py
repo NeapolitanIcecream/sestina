@@ -3,7 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
-from sestina.active_arm_gate import CURRENT_KNOWN_SPEND_USD, DEFAULT_PAID_CAP_USD
+from sestina.active_arm_gate import (
+    CURRENT_KNOWN_SPEND_USD,
+    DEFAULT_PAID_CAP_USD,
+    validate_active_arm_gate_artifact_schema,
+)
 
 ARTIFACT_TYPE = "sestina-next-experiment-protocol"
 SCHEMA_VERSION = 1
@@ -223,6 +227,12 @@ def _no_paid_gate_summary(
     leakage = _mapping(artifact.get("label_leakage"))
     random_reference = _mapping(artifact.get("random_variance_reference"))
     blocking: list[str] = []
+    schema_error: str | None = None
+    try:
+        validate_active_arm_gate_artifact_schema(artifact)
+    except ValueError as exc:
+        schema_error = str(exc)
+        blocking.append("no_paid_gate_artifact_schema_invalid")
 
     paid_calls = artifact.get("paid_calls_made")
     paid_spend = artifact.get("paid_spend_usd")
@@ -269,6 +279,8 @@ def _no_paid_gate_summary(
         "passed": not blocking,
         "blocking_reasons": blocking,
         "artifact_type": artifact.get("artifact_type"),
+        "schema_valid": schema_error is None,
+        "schema_error": schema_error,
         "active_arm_name": artifact.get("active_arm_name"),
         "random_control": artifact.get("candidate_random_control_baseline"),
         "paid_calls_made": paid_calls,
