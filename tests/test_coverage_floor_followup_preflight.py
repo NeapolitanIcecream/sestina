@@ -7,9 +7,7 @@ from typing import Any
 import pytest
 
 from scripts.run_coverage_floor_followup_preflight import (
-    DEFAULT_ACTIVE_GATE_ARTIFACT,
     DEFAULT_CONFIG,
-    DEFAULT_NO_PAID_SWEEP_ARTIFACT,
     PointwiseCallForbiddenError,
     _assert_pairwise_only_call_kind,
     build_coverage_floor_followup_preflight,
@@ -43,11 +41,12 @@ def test_preflight_blocks_missing_fresh_holdout_manifest(
     monkeypatch.setenv("SESTINA_LLM_API_KEY", "test-key")
     monkeypatch.setenv("SESTINA_LLM_BASE_URL", "https://llm.test")
     artifact_dir = tmp_path / "coverage-floor-preflight"
+    no_paid = _write_no_paid_inputs(tmp_path)
 
     payload = build_coverage_floor_followup_preflight(
         config_path=DEFAULT_CONFIG,
-        no_paid_sweep_artifact_path=DEFAULT_NO_PAID_SWEEP_ARTIFACT,
-        active_gate_artifact_path=DEFAULT_ACTIVE_GATE_ARTIFACT,
+        no_paid_sweep_artifact_path=no_paid["sweep"],
+        active_gate_artifact_path=no_paid["gate"],
         fresh_holdout_manifest_path=tmp_path / "missing-manifest.json",
         source_artifact_dir=tmp_path / "missing-pointwise",
         artifact_dir=artifact_dir,
@@ -80,17 +79,19 @@ def test_preflight_blocks_development_replay_manifest(
     monkeypatch.setenv("SESTINA_LLM_API_KEY", "test-key")
     monkeypatch.setenv("SESTINA_LLM_BASE_URL", "https://llm.test")
     artifact_dir = tmp_path / "coverage-floor-preflight"
-    development_manifest = (
-        Path(__file__).resolve().parents[1]
-        / "artifacts"
-        / "backtest-datasets"
-        / "arxiv-historical-pilot-manifest.json"
+    development_manifest = _write_manifest(
+        tmp_path,
+        name="arxiv_cs_LG_2023_01_development_replay",
+    )
+    no_paid = _write_no_paid_inputs(
+        tmp_path,
+        development_manifest_path=development_manifest,
     )
 
     payload = build_coverage_floor_followup_preflight(
         config_path=DEFAULT_CONFIG,
-        no_paid_sweep_artifact_path=DEFAULT_NO_PAID_SWEEP_ARTIFACT,
-        active_gate_artifact_path=DEFAULT_ACTIVE_GATE_ARTIFACT,
+        no_paid_sweep_artifact_path=no_paid["sweep"],
+        active_gate_artifact_path=no_paid["gate"],
         fresh_holdout_manifest_path=development_manifest,
         source_artifact_dir=tmp_path / "missing-pointwise",
         artifact_dir=artifact_dir,
@@ -119,11 +120,12 @@ def test_preflight_plans_pairwise_only_rows_when_fresh_inputs_exist(
     source_dir = tmp_path / "fresh-pointwise"
     _write_pointwise_artifacts(source_dir)
     artifact_dir = tmp_path / "coverage-floor-preflight"
+    no_paid = _write_no_paid_inputs(tmp_path)
 
     payload = build_coverage_floor_followup_preflight(
         config_path=DEFAULT_CONFIG,
-        no_paid_sweep_artifact_path=DEFAULT_NO_PAID_SWEEP_ARTIFACT,
-        active_gate_artifact_path=DEFAULT_ACTIVE_GATE_ARTIFACT,
+        no_paid_sweep_artifact_path=no_paid["sweep"],
+        active_gate_artifact_path=no_paid["gate"],
         fresh_holdout_manifest_path=manifest_path,
         source_artifact_dir=source_dir,
         artifact_dir=artifact_dir,
@@ -196,7 +198,14 @@ def test_pairwise_only_guard_rejects_pointwise_call_kind() -> None:
 
 
 def _write_fresh_manifest(tmp_path: Path) -> Path:
-    path = tmp_path / "fresh-manifest.json"
+    return _write_manifest(
+        tmp_path,
+        name="arxiv_cs_LG_2024_01_coverage_floor_holdout",
+    )
+
+
+def _write_manifest(tmp_path: Path, *, name: str) -> Path:
+    path = tmp_path / f"{name}.json"
     papers = []
     for index, paper_id in enumerate(["fresh_p1", "fresh_p2", "fresh_p3", "fresh_p4"]):
         papers.append(
@@ -218,7 +227,7 @@ def _write_fresh_manifest(tmp_path: Path) -> Path:
                 },
                 "buckets": [
                     {
-                        "name": "arxiv_cs_LG_2024_01_coverage_floor_holdout",
+                        "name": name,
                         "phase": "pilot",
                         "k": 1,
                         "papers": papers,
@@ -228,6 +237,132 @@ def _write_fresh_manifest(tmp_path: Path) -> Path:
         )
     )
     return path
+
+
+def _write_no_paid_inputs(
+    tmp_path: Path,
+    *,
+    development_manifest_path: Path | None = None,
+) -> dict[str, Path]:
+    sweep_path = tmp_path / "no-paid-algorithm-sweep.json"
+    gate_path = tmp_path / "active-arm-gate.json"
+    development_manifest = development_manifest_path or (
+        tmp_path / "development-replay-manifest.json"
+    )
+    sweep_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "sestina-no-paid-algorithm-sweep",
+                "schema_version": 1,
+                "phase": "pilot",
+                "paid_calls_made": 0,
+                "paid_spend_usd": 0.0,
+                "pointwise_calls_made": 0,
+                "manifest_path": str(development_manifest),
+                "analysis_parameters": {
+                    "seeds": [
+                        17,
+                        29,
+                        41,
+                        53,
+                        67,
+                        79,
+                        83,
+                        97,
+                        101,
+                        113,
+                        127,
+                        131,
+                        149,
+                        163,
+                        173,
+                        181,
+                        191,
+                        199,
+                        211,
+                        223,
+                    ],
+                    "scheduler_samples": 800,
+                    "posterior_samples": 900,
+                    "pairwise_strength": 2.5,
+                    "confidence_z": 1.96,
+                },
+                "aggregate_metrics": {
+                    "randomized_coverage_floor_hybrid_cached_replay": {
+                        "recall_at_k": 0.3675,
+                        "ndcg_at_k": 0.40342,
+                        "average_precision": 0.395577,
+                    }
+                },
+                "paired_deltas_vs_exact_pool_random": {
+                    "metric_deltas": {
+                        "recall_at_k": {"count": 20, "mean": 0.035},
+                        "ndcg_at_k": {"count": 20, "mean": 0.03419979},
+                        "average_precision": {"count": 20, "mean": 0.01775105},
+                    }
+                },
+                "label_policy": {"cache_availability_used_for_scheduling": True},
+                "candidate_arms_tried": [
+                    {"name": "randomized_coverage_floor_hybrid_cached_replay"}
+                ],
+                "control_arms": [{"name": "exact_pool_random_cached_replay"}],
+                "bucket_results": [
+                    {
+                        "seed": 17,
+                        "buckets": [
+                            {"bucket": "arxiv_cs_LG_2023_01_development_replay"}
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+    gate_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "sestina-active-arm-gate",
+                "schema_version": 1,
+                "paid_calls_made": 0,
+                "paid_spend_usd": 0.0,
+                "pointwise_calls_made": 0,
+                "active_arm_name": "randomized_coverage_floor_hybrid_cached_replay",
+                "candidate_random_control_baseline": "exact_pool_random_cached_replay",
+                "paid_followup_allowed": True,
+                "gate_policy": {},
+                "gate_verdict": {
+                    "paid_followup_allowed": True,
+                    "blocking_reasons": [],
+                    "paired_random_control_present": True,
+                    "seed_count": 20,
+                    "core_diagnostics_complete": True,
+                    "randomized_floor_or_paired_control_present": True,
+                    "no_future_label_or_cached_label_leakage": True,
+                    "recommended_next_action": "review fresh holdout dry-run preflight",
+                },
+                "paired_active_minus_random_deltas": {
+                    "metric_deltas": {
+                        "recall_at_k": {
+                            "count": 20,
+                            "mean": 0.035,
+                            "normal_approx_95_ci": [0.01934258, 0.05065742],
+                        },
+                        "ndcg_at_k": {"count": 20, "mean": 0.03419979},
+                        "average_precision": {"count": 20, "mean": 0.01775105},
+                    }
+                },
+                "seed_level_confidence_intervals": {},
+                "diagnostics": {"weak_bucket_diagnostics": {"available": True}},
+                "caveats": {"budget_completeness_caveat": {"present": False}},
+                "spend_estimate": {},
+                "label_leakage": {"present": False, "forbidden_true_keys": []},
+                "random_variance_reference": {
+                    "complete_20_seed_reference": True,
+                },
+                "input_artifacts": {},
+            }
+        )
+    )
+    return {"sweep": sweep_path, "gate": gate_path}
 
 
 def _write_pointwise_artifacts(source_dir: Path) -> None:
