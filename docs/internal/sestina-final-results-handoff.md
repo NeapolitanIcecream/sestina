@@ -20,6 +20,8 @@ Primary evidence:
   `docs/internal/sestina-pr-cleanup-plan.md`
 - Internal-review-only cleanup package:
   `docs/internal/sestina-internal-review-package.md`
+- Next experiment protocol:
+  `docs/internal/sestina-next-experiment-protocol.md`
 - Reviewed guarded execution:
   `artifacts/backtest-arxiv-new-information-guarded-execution/guarded-execution-go-no-go.json`
 - Empty guarded execution ledger:
@@ -132,6 +134,11 @@ Stop additional Sestina experiments in this campaign. Specifically:
 
 The next work should be cleanup and review readiness, not more experiment
 execution.
+
+Any future experiment round must start from the separate next-experiment
+protocol, not from this campaign result. The protocol keeps this result
+cached/no-paid, requires a no-paid gate before any future experiment, and limits
+fresh holdout validation to dry-run/preflight until the gate passes.
 
 ## PR And Publication Cleanup Readiness
 

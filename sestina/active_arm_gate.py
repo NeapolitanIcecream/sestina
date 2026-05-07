@@ -54,6 +54,24 @@ CORE_DIAGNOSTIC_KEYS = {
     "unique_future_positives_touched",
     "weak_bucket_deltas",
 }
+FORBIDDEN_LABEL_LEAKAGE_TRUE_KEYS = {
+    "future_labels_used_for_scheduling",
+    "uses_future_labels_for_scheduling",
+    "future_labels_used_as_model_features",
+    "future_labels_used_for_model_visible_selection",
+    "future_labels_used_in_model_visible_inputs",
+    "future_labels_used_for_prompting",
+    "future_labels_used_for_routing",
+    "uses_future_labels_for_decision",
+    "uses_future_labels_for_calibration",
+    "citation_labels_used_for_scheduling",
+    "future_citation_labels_used_for_scheduling",
+    "citation_outcomes_used_for_scheduling",
+    "good_paper_used_for_scheduling",
+    "matched_title_used_for_scheduling",
+    "matched_work_id_used_for_scheduling",
+    "cached_label_values_used_before_scheduling",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +177,7 @@ def build_active_arm_gate(
         active_arm=active_arm,
         random_control=random_control,
     )
+    label_leakage = _label_leakage_summary(active_artifact)
     random_reference = _random_variance_reference(
         random_variance_artifact,
         random_control=random_control,
@@ -174,6 +193,7 @@ def build_active_arm_gate(
         paired_deltas=paired_deltas,
         caveats=caveats,
         diagnostics=diagnostics,
+        label_leakage=label_leakage,
         random_reference=random_reference,
         spend_estimate=spend_estimate,
         paid_input=paid_input,
@@ -196,6 +216,7 @@ def build_active_arm_gate(
         "paired_active_minus_random_deltas": paired_deltas,
         "seed_level_confidence_intervals": seed_intervals,
         "diagnostics": diagnostics,
+        "label_leakage": label_leakage,
         "caveats": caveats,
         "spend_estimate": spend_estimate,
         "random_variance_reference": random_reference,
@@ -262,6 +283,7 @@ def _gate_verdict(
     paired_deltas: Mapping[str, Any],
     caveats: Mapping[str, Any],
     diagnostics: Mapping[str, Any],
+    label_leakage: Mapping[str, Any],
     random_reference: Mapping[str, Any],
     spend_estimate: Mapping[str, Any],
     paid_input: Mapping[str, Any],
@@ -302,6 +324,7 @@ def _gate_verdict(
     randomized_or_paired = bool(
         diagnostics["randomized_floor_or_paired_control"]["present"]
     )
+    no_label_leakage = not bool(label_leakage["present"])
     budget_ok = bool(spend_estimate["within_paid_cap"])
     budget_shortfall_present = bool(
         caveats["budget_completeness_caveat"]["present"]
@@ -384,6 +407,11 @@ def _gate_verdict(
         blocking_reasons.append(
             "core weak-bucket/graph/oracle diagnostics are incomplete"
         )
+    if not no_label_leakage:
+        blocking_reasons.append(
+            "future-label or cached-label leakage markers are true: "
+            + ", ".join(label_leakage["forbidden_true_keys"])
+        )
     if missing_label_present:
         blocking_reasons.append("missing-label caveat is present")
     if budget_shortfall_present:
@@ -412,6 +440,7 @@ def _gate_verdict(
         and random_reference_ok
         and randomized_or_paired
         and diagnostics_complete
+        and no_label_leakage
         and not missing_label_present
         and not budget_shortfall_present
         and budget_ok
@@ -446,6 +475,8 @@ def _gate_verdict(
         "minimum_seed_count": policy.minimum_seed_count,
         "randomized_floor_or_paired_control_present": randomized_or_paired,
         "core_diagnostics_complete": diagnostics_complete,
+        "no_future_label_or_cached_label_leakage": no_label_leakage,
+        "label_leakage": label_leakage,
         "full_random_variance_reference_complete": random_reference_ok,
         "no_paid_active_input": no_paid_input,
         "active_paid_metadata": paid_input,
@@ -884,6 +915,25 @@ def _diagnostics(
     }
 
 
+def _label_leakage_summary(artifact: Mapping[str, Any]) -> dict[str, Any]:
+    markers = _recursive_true_keys(
+        artifact,
+        keys=FORBIDDEN_LABEL_LEAKAGE_TRUE_KEYS,
+    )
+    return {
+        "present": bool(markers),
+        "forbidden_true_keys": sorted(markers),
+        "checked_keys": sorted(FORBIDDEN_LABEL_LEAKAGE_TRUE_KEYS),
+        "policy": (
+            "Future labels, citation outcomes, good_paper labels, matched work "
+            "identifiers, and cached label values must not be used for "
+            "scheduling, routing, prompts, or model-visible inputs. Future "
+            "labels are allowed only for retrospective evaluation and "
+            "diagnostics."
+        ),
+    }
+
+
 def _randomized_floor_diagnostics(
     artifact: Mapping[str, Any],
     *,
@@ -1200,6 +1250,22 @@ def _recursive_string_matches(value: Any, needle: str) -> int:
     if isinstance(value, list):
         return sum(_recursive_string_matches(item, needle) for item in value)
     return 0
+
+
+def _recursive_true_keys(value: Any, *, keys: set[str]) -> set[str]:
+    if isinstance(value, Mapping):
+        matches: set[str] = set()
+        for current_key, current_value in value.items():
+            if current_key in keys and current_value is True:
+                matches.add(current_key)
+            matches.update(_recursive_true_keys(current_value, keys=keys))
+        return matches
+    if isinstance(value, list):
+        matches: set[str] = set()
+        for item in value:
+            matches.update(_recursive_true_keys(item, keys=keys))
+        return matches
+    return set()
 
 
 def _string_value(payload: Mapping[str, Any] | None, key: str) -> str | None:
