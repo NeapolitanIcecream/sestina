@@ -670,8 +670,22 @@ def _metadata_bucket(paper: Paper) -> tuple[str, object]:
 
 
 def _metadata_value(value: object) -> object:
+    if isinstance(value, dict):
+        return tuple(
+            (str(key), _metadata_value(item))
+            for key, item in sorted(
+                value.items(),
+                key=lambda item: (str(item[0]), repr(item[0])),
+            )
+        )
     if isinstance(value, (list, tuple)):
-        return tuple(str(item) for item in value)
+        return tuple(_metadata_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_metadata_value(item) for item in value), key=repr))
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
     return value
 
 

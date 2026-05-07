@@ -194,6 +194,36 @@ def test_scheduler_allocates_purpose_coverage_when_possible() -> None:
     assert completed["data"]["proposal_counts_by_purpose"]["sentinel_outsider"] > 0
 
 
+def test_scheduler_accepts_structured_metadata_buckets() -> None:
+    """Regression: structured metadata buckets crashed coverage set accounting."""
+    papers = _diverse_scheduler_papers()
+    for index, paper in enumerate(papers):
+        paper.metadata["primary_category"] = {
+            "id": paper.metadata["primary_category"],
+            "namespace": "arxiv",
+            "path": ["computer_science", str(index % 3)],
+        }
+    selection = CandidateSelection(
+        candidate_ids=[f"p{index}" for index in range(1, 9)],
+        groups={
+            "exploit": ["p1", "p2", "p3", "p4"],
+            "boundary": ["p3", "p4", "p5", "p6"],
+            "explore": ["p7", "p8"],
+        },
+        scores={},
+    )
+
+    schedule = schedule_pairs(
+        papers,
+        candidate_selection=selection,
+        k=4,
+        budget=resolve_pairwise_budget(n=len(papers), candidate_size=8, override=8),
+        seed=321,
+    )
+
+    assert schedule.diagnostics["coverage"]["metadata_buckets_covered"] > 0
+
+
 def test_scheduler_empty_budget_emits_machine_readable_coverage(paper_set) -> None:
     papers = paper_set(5)
     selection = CandidateSelection(
