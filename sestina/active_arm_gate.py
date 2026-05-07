@@ -207,6 +207,7 @@ def build_active_arm_gate(
         "paid_followup_allowed": gate_verdict["paid_followup_allowed"],
         "paid_calls_made": 0,
         "paid_spend_usd": 0.0,
+        "pointwise_calls_made": 0,
         "spend_policy": (
             "This gate is offline-only and makes zero Sestina paid LLM calls; "
             "pointwise calls and paid labeling are outside this harness."
@@ -794,6 +795,7 @@ def _comparison_source_counts(
 ) -> dict[str, int]:
     active_total = 0
     random_total = 0
+    inspected_selected_sources = False
     for seed_payload in _list_value(artifact, "bucket_results"):
         if not isinstance(seed_payload, Mapping):
             continue
@@ -803,12 +805,25 @@ def _comparison_source_counts(
             arms = bucket.get("arms")
             if not isinstance(arms, Mapping):
                 continue
-            active_total += _comparison_value(arms.get(active_arm), key)
-            random_total += _comparison_value(arms.get(random_control), key)
-    if active_total or random_total:
+            active_payload = arms.get(active_arm)
+            random_payload = arms.get(random_control)
+            if _has_comparison_source(active_payload):
+                inspected_selected_sources = True
+                active_total += _comparison_value(active_payload, key)
+            if _has_comparison_source(random_payload):
+                inspected_selected_sources = True
+                random_total += _comparison_value(random_payload, key)
+    if inspected_selected_sources:
         return {"active_total": active_total, "random_control_total": random_total}
     fallback = _recursive_nonzero_count(artifact, key)
     return {"active_total": fallback, "random_control_total": 0}
+
+
+def _has_comparison_source(arm_payload: Any) -> bool:
+    return (
+        isinstance(arm_payload, Mapping)
+        and isinstance(arm_payload.get("comparison_source"), Mapping)
+    )
 
 
 def _comparison_value(arm_payload: Any, key: str) -> int:

@@ -21,6 +21,7 @@ def test_gate_allows_paid_followup_when_mean_margin_clears_policy() -> None:
     )
 
     assert payload["paid_followup_allowed"] is True
+    assert payload["pointwise_calls_made"] == 0
     assert payload["gate_verdict"]["mean_margin_gate_passed"] is True
     assert payload["gate_verdict"]["blocking_reasons"] == []
     validate_active_arm_gate_artifact_schema(payload)
@@ -95,6 +96,28 @@ def test_gate_blocks_when_active_schedule_is_under_resolved_budget() -> None:
     assert "budget-completeness caveat is present" in (
         payload["gate_verdict"]["blocking_reasons"]
     )
+
+
+def test_gate_ignores_unrelated_partial_rows_when_selected_arms_are_complete() -> None:
+    """Regression: sweep artifacts with multiple arms inherited unrelated partials."""
+    artifact = _active_artifact(
+        recall_deltas=[0.01] * 20,
+        ndcg_deltas=[0.0] * 20,
+        ap_deltas=[0.0] * 20,
+    )
+    artifact["bucket_results"][0]["buckets"][0]["arms"]["unrelated_candidate"] = {
+        "comparison_source": {
+            "scheduled_pairwise_total": 20,
+            "cached_pairwise_labels_available": 19,
+            "missing_pairwise_labels": 1,
+            "partial": True,
+        }
+    }
+
+    payload = build_active_arm_gate(artifact, _random_reference_artifact())
+
+    assert payload["paid_followup_allowed"] is True
+    assert payload["caveats"]["missing_label_caveat"]["present"] is False
 
 
 def test_gate_blocks_without_paired_random_control() -> None:
