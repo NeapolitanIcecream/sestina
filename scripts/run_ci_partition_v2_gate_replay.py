@@ -47,7 +47,6 @@ from sestina.ci_partition_gate import (  # noqa: E402
     schedule_cached_exact_pool_random,
 )
 from sestina.diagnostics import write_json_artifact  # noqa: E402
-from sestina.models import PairwiseComparison, ScheduledPair  # noqa: E402
 from sestina.scheduler import resolve_pairwise_budget  # noqa: E402
 from sestina.scheduler_followup import load_pointwise_papers_from_artifacts  # noqa: E402
 

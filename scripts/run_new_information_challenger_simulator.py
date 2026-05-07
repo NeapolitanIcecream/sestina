@@ -47,7 +47,6 @@ from sestina.ci_partition_gate import (  # noqa: E402
     schedule_cached_exact_pool_random,
 )
 from sestina.diagnostics import write_json_artifact  # noqa: E402
-from sestina.models import PairwiseComparison  # noqa: E402
 from sestina.new_information_challenger import (  # noqa: E402
     NewInformationChallengerConfig,
     replay_new_information_challenger,

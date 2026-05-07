@@ -368,7 +368,6 @@ def _new_information_items(
 ) -> list[_NewInfoItem]:
     if not papers:
         return []
-    by_id = {paper.paper_id: paper for paper in papers}
     ranked = sorted(
         papers,
         key=lambda paper: (

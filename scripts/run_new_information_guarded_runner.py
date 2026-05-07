@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import sys
-import time
 import urllib.request
 from collections import Counter
 from pathlib import Path
