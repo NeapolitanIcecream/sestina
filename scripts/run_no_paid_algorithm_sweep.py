@@ -464,6 +464,9 @@ def run_no_paid_algorithm_sweep(
             "recommended_next_action": best_gate["recommended_next_action"],
         }
     else:
+        stale_active_gate_removed = _remove_stale_active_gate_artifact(
+            active_gate_output_path
+        )
         blocked = _blocked_protocol_report(
             sweep_artifact_path=output_path,
             best_candidate=best_candidate,
@@ -475,6 +478,7 @@ def run_no_paid_algorithm_sweep(
         protocol_outcome = {
             "status": "blocked_no_candidate_passed",
             "blocked_protocol_artifact_path": str(blocked_protocol_output_path),
+            "stale_active_gate_artifact_removed": stale_active_gate_removed,
             "blocking_reasons": best_gate["gate_verdict"]["blocking_reasons"],
             "next_experiment_protocol": blocked["next_experiment_protocol"],
         }
@@ -483,6 +487,7 @@ def run_no_paid_algorithm_sweep(
             "artifact_path": None,
             "artifact_type": best_gate["artifact_type"],
             "paid_followup_allowed": False,
+            "stale_artifact_removed": stale_active_gate_removed,
             "gate_verdict": best_gate["gate_verdict"],
             "recommended_next_action": best_gate["recommended_next_action"],
             "not_written_reason": (
@@ -593,6 +598,13 @@ def validate_blocked_protocol_report(payload: Mapping[str, Any]) -> None:
     gate = protocol["future_experiment_gate"]["no_paid_gate"]
     if gate["passed"] is not False:
         raise ValueError("blocked protocol report must keep no-paid gate blocked")
+
+
+def _remove_stale_active_gate_artifact(active_gate_output_path: Path) -> bool:
+    if not active_gate_output_path.exists():
+        return False
+    active_gate_output_path.unlink()
+    return True
 
 
 def _run_bucket_arms(

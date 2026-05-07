@@ -13,6 +13,7 @@ from scripts.run_no_paid_algorithm_sweep import (
     BLOCKED_PROTOCOL_ARTIFACT_TYPE,
     CANDIDATE_ARMS,
     SCHEMA_VERSION,
+    _remove_stale_active_gate_artifact,
     validate_blocked_protocol_report,
     validate_no_paid_sweep_artifact_schema,
 )
@@ -156,6 +157,15 @@ def test_blocked_protocol_report_keeps_next_experiment_gate_blocked() -> None:
     report["active_arm_gate_artifact_produced"] = True
     with pytest.raises(ValueError, match="cannot produce an active gate"):
         validate_blocked_protocol_report(report)
+
+
+def test_blocked_sweep_removes_stale_active_gate_artifact(tmp_path) -> None:
+    active_gate_path = tmp_path / "active-arm-gate.json"
+    active_gate_path.write_text('{"paid_followup_allowed": true}\n')
+
+    assert _remove_stale_active_gate_artifact(active_gate_path) is True
+    assert not active_gate_path.exists()
+    assert _remove_stale_active_gate_artifact(active_gate_path) is False
 
 
 def _paper(paper_id: str, *, probability: float) -> Paper:
