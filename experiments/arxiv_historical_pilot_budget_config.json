@@ -1,0 +1,68 @@
+{
+  "budget_cap_usd": 100.0,
+  "currency": "USD",
+  "rate_assumption_note": "Pilot-specific estimate for eight historical arXiv buckets with up to 80 papers each and K=5. Rate values are planning estimates and are guarded by the paid-run ledger cap.",
+  "model_name_policy": {
+    "require_provider_prefix": true,
+    "availability_check_required_before_paid_run": true
+  },
+  "pairwise_budget_ablation": {
+    "enabled": true,
+    "mode": "prefix_reuse",
+    "reuse_scheduled_pairwise_prefixes": true,
+    "points": [
+      "0",
+      "K",
+      "K + sqrt(n)",
+      "B_pair"
+    ],
+    "metrics_artifact": "pairwise_budget_ablation_metrics.csv"
+  },
+  "rate_card": {
+    "openai/gpt-5.4-mini": {
+      "input_usd_per_1m_tokens": 0.25,
+      "output_usd_per_1m_tokens": 2.0,
+      "discount_multiplier": 1.0,
+      "note": "Cheap-model placeholder estimate for abstract-level pointwise and pairwise pilot passes."
+    }
+  },
+  "token_assumptions": {
+    "pointwise": {
+      "input_tokens_per_call": 900,
+      "output_tokens_per_call": 220
+    },
+    "pairwise": {
+      "input_tokens_per_call": 1500,
+      "output_tokens_per_call": 180
+    },
+    "audit_pairwise": {
+      "input_tokens_per_call": 1500,
+      "output_tokens_per_call": 220
+    }
+  },
+  "phases": [
+    {
+      "name": "pilot",
+      "allocation_fraction": 1.0,
+      "pointwise_model": "openai/gpt-5.4-mini",
+      "pairwise_model": "openai/gpt-5.4-mini",
+      "audit_model": "openai/gpt-5.4-mini",
+      "strategies": [
+        "random",
+        "semantic_baseline",
+        "pointwise_only",
+        "pointwise_random_pairwise",
+        "sestina_active_pairwise"
+      ],
+      "buckets": [
+        {
+          "name": "arxiv_historical_pilot_80x8",
+          "n": 80,
+          "k": 5,
+          "count": 8
+        }
+      ],
+      "audit_pairwise_calls": 0
+    }
+  ]
+}
