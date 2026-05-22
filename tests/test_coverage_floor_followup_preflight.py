@@ -26,7 +26,7 @@ class _FakeResponse:
 
     def read(self) -> bytes:
         return json.dumps(
-            {"data": [{"id": "openai/gpt-5.4-mini"}]},
+            {"data": [{"id": "gpt-5.4-mini"}]},
         ).encode("utf-8")
 
 
@@ -161,6 +161,66 @@ def test_preflight_plans_pairwise_only_rows_when_fresh_inputs_exist(
     assert all(
         row["cached_label_values_used_before_scheduling"] is False for row in rows
     )
+
+
+def test_preflight_allows_resuming_when_existing_pairwise_ledger_matches_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a mid-stream pairwise rerun was blocked by a nonzero ledger."""
+    monkeypatch.setenv("SESTINA_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("SESTINA_LLM_BASE_URL", "https://llm.test")
+    manifest_path = _write_fresh_manifest(tmp_path)
+    source_dir = tmp_path / "fresh-pointwise"
+    _write_pointwise_artifacts(source_dir)
+    artifact_dir = tmp_path / "coverage-floor-preflight"
+    no_paid = _write_no_paid_inputs(tmp_path)
+
+    initial = build_coverage_floor_followup_preflight(
+        config_path=DEFAULT_CONFIG,
+        no_paid_sweep_artifact_path=no_paid["sweep"],
+        active_gate_artifact_path=no_paid["gate"],
+        fresh_holdout_manifest_path=manifest_path,
+        source_artifact_dir=source_dir,
+        artifact_dir=artifact_dir,
+        ledger_path=artifact_dir / "ledger.jsonl",
+        output_path=artifact_dir / "preflight.json",
+        planned_pairs_output_path=artifact_dir / "planned-pair-occurrences.jsonl",
+        max_usd=2.0,
+        urlopen=_fake_urlopen,
+    )
+    first_row = json.loads(
+        (artifact_dir / "planned-pair-occurrences.jsonl").read_text().splitlines()[0]
+    )
+    _write_pairwise_artifact_and_ledger(
+        artifact_dir=artifact_dir,
+        ledger_path=artifact_dir / "ledger.jsonl",
+        row=first_row,
+    )
+
+    resumed = build_coverage_floor_followup_preflight(
+        config_path=DEFAULT_CONFIG,
+        no_paid_sweep_artifact_path=no_paid["sweep"],
+        active_gate_artifact_path=no_paid["gate"],
+        fresh_holdout_manifest_path=manifest_path,
+        source_artifact_dir=source_dir,
+        artifact_dir=artifact_dir,
+        ledger_path=artifact_dir / "ledger.jsonl",
+        output_path=artifact_dir / "preflight.json",
+        planned_pairs_output_path=artifact_dir / "planned-pair-occurrences.jsonl",
+        max_usd=2.0,
+        urlopen=_fake_urlopen,
+    )
+
+    assert resumed["final_go_no_go"]["decision"] == "go"
+    assert "existing_planned_ledger_spend_zero" not in resumed["final_go_no_go"][
+        "blocking_reasons"
+    ]
+    assert resumed["totals"]["unique_cached_pairwise_labels"] == 1
+    assert resumed["totals"]["unique_missing_pairwise_labels"] == (
+        initial["totals"]["unique_missing_pairwise_labels"] - 1
+    )
+    assert resumed["resume_state"]["resumable"] is True
 
 
 def test_preflight_schema_rejects_pointwise_calls() -> None:
@@ -383,7 +443,7 @@ def _write_pointwise_artifacts(source_dir: Path) -> None:
                     "artifact_type": "sestina-backtest-call",
                     "phase": "pilot",
                     "bucket": bucket,
-                    "model": "openai/gpt-5.4-mini",
+                    "model": "gpt-5.4-mini",
                     "kind": "pointwise",
                     "status": "ok",
                     "response": assessment.to_dict(),
@@ -396,3 +456,71 @@ def _write_pointwise_artifacts(source_dir: Path) -> None:
                 }
             )
         )
+
+
+def _write_pairwise_artifact_and_ledger(
+    *,
+    artifact_dir: Path,
+    ledger_path: Path,
+    row: dict[str, Any],
+) -> None:
+    bucket = str(row["bucket"])
+    left_id = str(row["left_id"])
+    right_id = str(row["right_id"])
+    artifact_path = (
+        artifact_dir
+        / "pilot"
+        / bucket
+        / "calls"
+        / f"0001-pairwise_active-{fingerprint(bucket + ':' + left_id + ':' + right_id)}.json"
+    )
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "sestina-backtest-call",
+                "phase": "pilot",
+                "bucket": bucket,
+                "model": "gpt-5.4-mini",
+                "kind": "pairwise_active",
+                "status": "ok",
+                "response": {
+                    "winner": "left",
+                    "soft_probability": 0.6,
+                    "confidence": 0.7,
+                    "reasons": ["fixture"],
+                },
+                "comparison": {
+                    "left_id": left_id,
+                    "right_id": right_id,
+                    "winner": "left",
+                    "soft_probability": 0.6,
+                    "confidence": 0.7,
+                    "reasons": ["fixture"],
+                    "order": row.get("order") or {},
+                    "metadata": {},
+                },
+                "subject": {
+                    "left_id": left_id,
+                    "right_id": right_id,
+                    "row_roles": [row.get("row_role")],
+                },
+            }
+        )
+    )
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "phase": "pilot",
+                "bucket": bucket,
+                "model": "gpt-5.4-mini",
+                "kind": "pairwise_active",
+                "status": "ok",
+                "artifact_path": str(artifact_path),
+                "estimated_cost_usd": 0.001,
+                "billable_cost_usd": 0.001,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )

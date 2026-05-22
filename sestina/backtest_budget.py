@@ -20,7 +20,7 @@ ZERO_LLM_STRATEGIES = frozenset({"random", "semantic_baseline"})
 KNOWN_STRATEGIES = POINTWISE_STRATEGIES | PAIRWISE_STRATEGIES | ZERO_LLM_STRATEGIES
 
 DEFAULT_MODEL_NAME_POLICY = {
-    "require_provider_prefix": True,
+    "require_provider_prefix": False,
     "availability_check_required_before_paid_run": True,
 }
 DEFAULT_PAIRWISE_BUDGET_ABLATION = {
@@ -260,9 +260,9 @@ def _estimate_phase(
             f"unknown backtest strategies in phase {phase_name}: {unknown}"
         )
 
-    pointwise_model = str(phase.get("pointwise_model", "openai/gpt-5.4-mini"))
+    pointwise_model = str(phase.get("pointwise_model", "gpt-5.4-mini"))
     pairwise_model = str(phase.get("pairwise_model", pointwise_model))
-    audit_model = str(phase.get("audit_model", "openai/gpt-5.4"))
+    audit_model = str(phase.get("audit_model", "gpt-5.4-mini"))
     audit_calls = int(phase.get("audit_pairwise_calls", 0))
     if audit_calls < 0:
         diagnostics.record(

@@ -1,20 +1,26 @@
 # Sestina Next Experiment Protocol
 
-Date: 2026-05-07
+Date: 2026-05-08
 
 Workflow: `sestina-next-experiment-loop`
 
-Status: protocol patch for a future PR. This document and its source/test
-counterparts make zero paid Sestina LLM calls, zero pointwise calls, no paid
-labels, no historical ledger edits, and no raw call artifact edits.
+Status: autonomous fresh-holdout campaign policy. This document and its
+source/test counterparts make zero paid Sestina LLM calls, zero pointwise calls,
+no paid labels, no historical ledger edits, and no raw call artifact edits.
 
 ## Current Result Boundary
 
-The current campaign remains stopped. The best current result is still the
+The cached result boundary remains stopped for publication claims. The best
+current result is still the
 budget-filled `new_information_challenger_cached_replay` against
 `exact_pool_random_cached_replay`, followed by reviewed guarded cache-only
 execution of the exact frozen manifest. It is a cached/no-paid internal result,
 not a fresh holdout validation and not a publication-ready paid-label result.
+
+Separately, the next fresh-holdout campaign is now authorized to continue
+autonomously under the USD 100 campaign cap. Missing fresh holdout manifests and
+missing reviewed pointwise artifacts should be handled by automation, not
+treated as user-permission blockers.
 
 Cleanup and publication work may summarize the result, but public-facing
 material must preserve these boundaries:
@@ -71,21 +77,35 @@ reviewer-approved protocol explicitly reopens that work.
 ## Fresh Holdout Protocol
 
 Fresh holdout validation may only begin after the no-paid gate passes. Passing
-the no-paid gate still does not authorize paid label purchase by itself.
+the no-paid gate still does not authorize arbitrary paid label purchase by
+itself.
 
-The first permitted step is dry-run/preflight only. The fresh holdout protocol
-must require:
+The permitted sequence is:
+
+1. Freeze a fresh historical holdout design before any fresh result analysis.
+2. Build the fresh manifest with no overlap against the old 8 development
+   buckets.
+3. Generate and review pointwise artifacts only for that fresh holdout under the
+   campaign cap.
+4. Run the coverage-floor preflight.
+5. If and only if the preflight says `go`, run guarded pairwise-only validation.
+6. Analyze against `exact_pool_random_cached_replay` with Recall@K primary and
+   nDCG@K/AP secondary.
+
+The fresh holdout protocol must require:
 
 - Provider/model availability check before any label-generation call.
 - Separate artifact directory.
 - JSONL ledger.
 - Hard `--max-usd` cap under the remaining paid cap.
-- Zero pointwise calls unless a separate explicit approval names the pointwise
-  experiment.
-- Pairwise-only runner guardrails and immediate abort on any pointwise-call
-  attempt.
+- Pointwise calls scoped only to fresh-holdout artifact generation/review.
+- Pairwise-only validation guardrails and immediate abort on any pointwise-call
+  attempt during validation.
 - No future-label leakage and no cached label values used before scheduling.
 - Immutable historical paid ledgers and raw paid-call artifacts.
+- Ledger usage/cost fields sufficient to enforce the cap; use upstream returned
+  cost when present, otherwise upstream returned usage with configured rates,
+  otherwise the conservative configured token estimate.
 
 Machine-readable contract:
 
@@ -93,10 +113,13 @@ Machine-readable contract:
 uv run python scripts/validate_next_experiment_protocol.py
 ```
 
-With no no-paid gate artifact, the command emits a blocked protocol. To test a
-future gate, pass `--no-paid-gate-artifact` and an optional
-`--fresh-holdout-request` JSON object; the protocol still writes zero paid
-calls and authorizes no label purchase.
+With no no-paid gate artifact, the command emits a blocked protocol. To test the
+fresh-holdout path, pass `--no-paid-gate-artifact` and a
+`--fresh-holdout-request` JSON object with
+`standing_campaign_authorization=true` and
+`fresh_holdout_pointwise_artifacts_authorized=true`; the protocol still writes
+zero paid calls and does not authorize work outside the fresh-holdout campaign
+scope.
 
 ## Verification
 
@@ -112,4 +135,3 @@ Full repo verification before PR:
 uv run pytest -p no:cacheprovider
 git diff --check
 ```
-

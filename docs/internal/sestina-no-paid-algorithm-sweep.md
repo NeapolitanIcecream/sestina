@@ -5,8 +5,9 @@ Date: 2026-05-07
 Workflow: `sestina-no-paid-algorithm-sweep`
 
 Status: no-paid offline replay over cached/historical local artifacts. This is
-not a fresh holdout validation and does not authorize paid label purchase. The
-current campaign remains stopped.
+not a fresh holdout validation and does not authorize paid label purchase by
+itself. It is now the passed gate that feeds the autonomous fresh-holdout
+campaign.
 
 ## Boundary
 
@@ -18,11 +19,10 @@ pointwise/pairwise artifacts and wrote derived artifacts only:
 - `artifacts/backtest-arxiv-no-paid-algorithm-sweep/active-arm-gate.json`
 - `artifacts/backtest-arxiv-no-paid-algorithm-sweep/next-experiment-protocol-from-sweep.json`
 
-The active-arm gate passed for a no-paid replay candidate, but the embedded next
-experiment protocol still authorizes no label purchase. The only protocol next
-step is review of a separate fresh-holdout dry-run/preflight protocol with
-provider availability, JSONL ledger, separate artifact directory, hard max-USD
-cap, pairwise-only guardrails, and no pointwise calls.
+The active-arm gate passed for a no-paid replay candidate. After PR #5, standing
+campaign authorization delegates fresh holdout bucket selection and fresh-holdout
+pointwise artifact generation to automation under the USD 100 campaign cap.
+Pairwise validation remains pairwise-only after a separate preflight says `go`.
 
 ## Inputs
 
@@ -115,9 +115,11 @@ schema-valid and passed:
 - `pointwise_calls_made`: 0.
 - No future-label or cached-label leakage markers.
 - Full 20-seed random variance reference complete.
-- Current result boundary remains cached/no-paid and stopped.
+- Current result boundary remains cached/no-paid for publication claims.
 
-The passed gate does not buy labels and does not start fresh holdout validation.
+The passed gate does not buy labels by itself. The autonomous campaign may now
+freeze a fresh holdout, generate reviewed pointwise artifacts for that holdout,
+and proceed to guarded pairwise-only validation if the preflight clears.
 
 ## Reproduction
 

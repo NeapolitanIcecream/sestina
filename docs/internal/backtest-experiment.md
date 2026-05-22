@@ -203,13 +203,9 @@ estimate exceeds the cap. It never calls an LLM.
 
 Default planning assumptions in `experiments/backtest_budget_config.json`:
 
-- Broad pointwise and pairwise passes use `openai/gpt-5.4-mini` or an equivalent
-  cheap model with the provider prefix required by the endpoint.
-- The stronger-model audit uses `openai/gpt-5.4` or equivalent only on a small
-  sample.
-- Model names must be confirmed before paid execution. For OpenAI-routed models
-  on this endpoint, use the `openai/` prefix, such as `openai/gpt-5.4-mini`, not
-  bare `gpt-5.4-mini`.
+- Broad pointwise, pairwise, and audit passes use `gpt-5.4-mini`.
+- Model names must be confirmed before paid execution. The current campaign
+  config uses the unprefixed model name `gpt-5.4-mini`.
 - Before any live run, query the endpoint's model list or run an explicit
   low-cost availability probe for every configured model, then freeze the
   verified names in the run manifest.

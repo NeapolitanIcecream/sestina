@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from difflib import SequenceMatcher
@@ -19,7 +20,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ARXIV_API_URL = "https://export.arxiv.org/api/query"
+ARXIV_API_URL = "https://arxiv.org/api/query"
+DEFAULT_HULDRA_BASE_URL = "http://127.0.0.1:8765"
+DEFAULT_HULDRA_WAIT_TIMEOUT_SECONDS = 600.0
+DEFAULT_HULDRA_CLIENT_ID = "sestina-historical-arxiv-manifest"
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 SEMANTIC_SCHOLAR_GRAPH_URL = "https://api.semanticscholar.org/graph/v1/paper"
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
@@ -30,6 +34,17 @@ Sleep = Callable[[float], None]
 Clock = Callable[[], float]
 MetadataProvider = Literal["semantic_scholar", "openalex", "auto"]
 UnmatchedPolicy = Literal["drop", "zero", "fail"]
+ArxivMetadataSource = Literal["direct", "huldra"]
+
+
+class ArxivMetadataRateLimitError(RuntimeError):
+    def __init__(self, message: str, *, retry_after: str | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class HuldraMetadataError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +266,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="consecutive successful arXiv requests before moving to the next tier",
     )
     parser.add_argument(
+        "--arxiv-page-size",
+        type=int,
+        help=(
+            "maximum arXiv API records per request; defaults to --limit. "
+            "Use a smaller value for conservative arxiv.org paging."
+        ),
+    )
+    parser.add_argument(
+        "--arxiv-metadata-source",
+        choices=["direct", "huldra"],
+        default="direct",
+        help="source for arXiv metadata; direct preserves the historical arXiv API path",
+    )
+    parser.add_argument(
+        "--huldra-base-url",
+        default=DEFAULT_HULDRA_BASE_URL,
+        help="local Huldra API base URL used when --arxiv-metadata-source=huldra",
+    )
+    parser.add_argument(
+        "--huldra-wait-timeout-seconds",
+        type=float,
+        default=DEFAULT_HULDRA_WAIT_TIMEOUT_SECONDS,
+        help="maximum Huldra inline wait time for a bucket request",
+    )
+    parser.add_argument(
+        "--huldra-client-id",
+        default=DEFAULT_HULDRA_CLIENT_ID,
+        help="Huldra client_id for historical manifest metadata requests",
+    )
+    parser.add_argument(
         "--part-dir",
         type=Path,
         help="directory of per-bucket manifests for resumable pilot builds",
@@ -300,6 +345,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--part-dir is required with --reuse-parts or --write-parts")
     if args.target_bucket_count is not None and args.target_bucket_count <= 0:
         parser.error("--target-bucket-count must be greater than zero")
+    if args.huldra_wait_timeout_seconds <= 0:
+        parser.error("--huldra-wait-timeout-seconds must be greater than zero")
+    if not args.huldra_client_id.strip():
+        parser.error("--huldra-client-id must not be blank")
     try:
         arxiv_pacing = parse_arxiv_pacing_config(
             args.arxiv_pacing_delays_seconds,
@@ -347,8 +396,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 openalex_mailto=args.openalex_mailto,
                 arxiv_retry_attempts=args.arxiv_retry_attempts,
                 arxiv_retry_delay_seconds=args.arxiv_retry_delay_seconds,
+                arxiv_page_size=args.arxiv_page_size,
+                arxiv_metadata_source=args.arxiv_metadata_source,
+                huldra_base_url=args.huldra_base_url,
+                huldra_wait_timeout_seconds=args.huldra_wait_timeout_seconds,
+                huldra_client_id=args.huldra_client_id,
                 arxiv_pacer=pacer,
             )
+        except ArxivMetadataRateLimitError as exc:
+            retry_after = exc.retry_after or "not_provided"
+            sys.stderr.write(
+                "stopped after Huldra arXiv metadata rate limit/cooldown for "
+                f"{spec.category}:{spec.date_bucket.label}; "
+                f"retry_after={retry_after}; {exc}\n"
+            )
+            return 75
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
                 retry_after = exc.headers.get("Retry-After") if exc.headers else None
@@ -359,6 +421,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 return 75
             raise
+        except HuldraMetadataError as exc:
+            sys.stderr.write(
+                "failed Huldra arXiv metadata fetch for "
+                f"{spec.category}:{spec.date_bucket.label}: {exc}\n"
+            )
+            return 1
 
         if args.write_parts and part_path is not None:
             part_path.parent.mkdir(parents=True, exist_ok=True)
@@ -409,11 +477,14 @@ def build_manifest(
     openalex_mailto: str | None = None,
     arxiv_retry_attempts: int = 5,
     arxiv_retry_delay_seconds: float = 5.0,
+    arxiv_page_size: int | None = None,
+    arxiv_metadata_source: ArxivMetadataSource = "direct",
+    huldra_base_url: str = DEFAULT_HULDRA_BASE_URL,
+    huldra_wait_timeout_seconds: float = DEFAULT_HULDRA_WAIT_TIMEOUT_SECONDS,
+    huldra_client_id: str = DEFAULT_HULDRA_CLIENT_ID,
     arxiv_pacer: ArxivRequestPacer | None = None,
     urlopen: UrlOpen = urllib.request.urlopen,
 ) -> dict[str, Any]:
-    if arxiv_pacer is not None:
-        arxiv_pacer.before_request()
     try:
         papers = fetch_arxiv_papers(
             category=category,
@@ -423,13 +494,15 @@ def build_manifest(
             urlopen=urlopen,
             retry_attempts=arxiv_retry_attempts,
             retry_delay_seconds=arxiv_retry_delay_seconds,
+            page_size=arxiv_page_size,
+            pacer=arxiv_pacer,
+            metadata_source=arxiv_metadata_source,
+            huldra_base_url=huldra_base_url,
+            huldra_wait_timeout_seconds=huldra_wait_timeout_seconds,
+            huldra_client_id=huldra_client_id,
         )
     except urllib.error.HTTPError as exc:
-        if exc.code == 429 and arxiv_pacer is not None:
-            arxiv_pacer.record_rate_limited()
         raise
-    if arxiv_pacer is not None:
-        arxiv_pacer.record_success()
     matches = fetch_citation_matches(
         papers,
         provider=metadata_provider,
@@ -712,35 +785,163 @@ def fetch_arxiv_papers(
     sleep: Sleep = time.sleep,
     retry_attempts: int = 5,
     retry_delay_seconds: float = 5.0,
+    page_size: int | None = None,
+    pacer: ArxivRequestPacer | None = None,
+    metadata_source: ArxivMetadataSource = "direct",
+    huldra_base_url: str = DEFAULT_HULDRA_BASE_URL,
+    huldra_wait_timeout_seconds: float = DEFAULT_HULDRA_WAIT_TIMEOUT_SECONDS,
+    huldra_client_id: str = DEFAULT_HULDRA_CLIENT_ID,
 ) -> list[ArxivPaper]:
     if limit <= 0:
         raise ValueError("--limit must be greater than zero")
     if end < start:
         raise ValueError("end date must be on or after start date")
+    if metadata_source == "huldra":
+        return fetch_huldra_arxiv_papers(
+            category=category,
+            start=start,
+            end=end,
+            limit=limit,
+            base_url=huldra_base_url,
+            wait_timeout_seconds=huldra_wait_timeout_seconds,
+            client_id=huldra_client_id,
+            urlopen=urlopen,
+        )
+    if metadata_source != "direct":
+        raise ValueError(f"unsupported arXiv metadata source: {metadata_source}")
+    effective_page_size = limit if page_size is None else page_size
+    if effective_page_size <= 0:
+        raise ValueError("arXiv page size must be greater than zero")
     query = (
         f"cat:{category} AND submittedDate:[{start:%Y%m%d}0000 TO {end:%Y%m%d}2359]"
     )
-    params = {
-        "search_query": query,
+    papers: list[ArxivPaper] = []
+    seen_arxiv_ids: set[str] = set()
+    for offset in range(0, limit, effective_page_size):
+        request_limit = min(effective_page_size, limit - len(papers))
+        if request_limit <= 0:
+            break
+        params = {
+            "search_query": query,
+            "start": offset,
+            "max_results": request_limit,
+            "sortBy": "submittedDate",
+            "sortOrder": "ascending",
+        }
+        url = ARXIV_API_URL + "?" + urllib.parse.urlencode(params)
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "sestina-historical-arxiv-manifest/0.1"},
+            method="GET",
+        )
+        if pacer is not None:
+            pacer.before_request()
+        try:
+            feed = _read_bytes_with_retries(
+                request,
+                urlopen=urlopen,
+                sleep=sleep,
+                retry_attempts=retry_attempts,
+                retry_delay_seconds=retry_delay_seconds,
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and pacer is not None:
+                pacer.record_rate_limited()
+            raise
+        if pacer is not None:
+            pacer.record_success()
+        page_papers = parse_arxiv_feed(feed)
+        if not page_papers:
+            break
+        for paper in page_papers:
+            if paper.arxiv_id in seen_arxiv_ids:
+                continue
+            papers.append(paper)
+            seen_arxiv_ids.add(paper.arxiv_id)
+            if len(papers) >= limit:
+                break
+        if len(page_papers) < request_limit or len(papers) >= limit:
+            break
+    return papers
+
+
+def fetch_huldra_arxiv_papers(
+    *,
+    category: str,
+    start: date,
+    end: date,
+    limit: int,
+    base_url: str = DEFAULT_HULDRA_BASE_URL,
+    wait_timeout_seconds: float = DEFAULT_HULDRA_WAIT_TIMEOUT_SECONDS,
+    client_id: str = DEFAULT_HULDRA_CLIENT_ID,
+    urlopen: UrlOpen = urllib.request.urlopen,
+) -> list[ArxivPaper]:
+    if wait_timeout_seconds <= 0:
+        raise ValueError("Huldra wait timeout must be greater than zero")
+    if not client_id.strip():
+        raise ValueError("Huldra client ID must not be blank")
+
+    request_payload = {
+        "client_id": client_id,
+        "search_query": f"cat:{category}",
+        "submitted_start": _huldra_submitted_bound(start),
+        "submitted_end": _huldra_submitted_bound(end + timedelta(days=1)),
         "start": 0,
         "max_results": limit,
-        "sortBy": "submittedDate",
-        "sortOrder": "ascending",
+        "sort_by": "submittedDate",
+        "sort_order": "ascending",
+        "cache_policy": "cache_or_enqueue",
+        "readiness": "analysis_ready",
+        "timeout_seconds": wait_timeout_seconds,
     }
-    url = ARXIV_API_URL + "?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "sestina-historical-arxiv-manifest/0.1"},
-        method="GET",
-    )
-    feed = _read_bytes_with_retries(
-        request,
+    sync_result = _huldra_post_json(
+        base_url=base_url,
+        path="/v1/sync",
+        payload={
+            "requests": [request_payload],
+            "wait": True,
+            "wait_timeout_seconds": wait_timeout_seconds,
+        },
         urlopen=urlopen,
-        sleep=sleep,
-        retry_attempts=retry_attempts,
-        retry_delay_seconds=retry_delay_seconds,
+        timeout_seconds=max(60.0, wait_timeout_seconds + 30.0),
     )
-    return parse_arxiv_feed(feed)
+    _raise_for_huldra_rate_limit(sync_result, stage="sync")
+
+    read_payload = {
+        **request_payload,
+        "cache_policy": "cache_only",
+        "readiness": "analysis_ready",
+    }
+    result = _huldra_post_json(
+        base_url=base_url,
+        path="/v1/requests",
+        payload=read_payload,
+        urlopen=urlopen,
+        timeout_seconds=60.0,
+    )
+    _raise_for_huldra_rate_limit(result, stage="cache read")
+
+    papers_payload = result.get("papers")
+    if not isinstance(papers_payload, list):
+        papers_payload = []
+    papers = [
+        paper
+        for paper in (
+            _arxiv_paper_from_huldra_payload(item)
+            for item in papers_payload
+            if isinstance(item, Mapping)
+        )
+        if paper is not None
+    ]
+    if result.get("status") != "ready" or not papers:
+        raise HuldraMetadataError(
+            _huldra_failure_message(
+                "Huldra did not return analysis-ready papers",
+                result,
+                sync_result=sync_result,
+            )
+        )
+    return papers
 
 
 def parse_arxiv_feed(feed: bytes | str) -> list[ArxivPaper]:
@@ -785,6 +986,197 @@ def parse_arxiv_feed(feed: bytes | str) -> list[ArxivPaper]:
             )
         )
     return papers
+
+
+def _huldra_submitted_bound(value: date) -> str:
+    return datetime(value.year, value.month, value.day, tzinfo=UTC).isoformat()
+
+
+def _huldra_post_json(
+    *,
+    base_url: str,
+    path: str,
+    payload: Mapping[str, Any],
+    urlopen: UrlOpen,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    url = base_url.rstrip("/") + path
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "sestina-historical-arxiv-manifest/0.1",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise ArxivMetadataRateLimitError(
+                f"Huldra {path} returned HTTP 429",
+                retry_after=exc.headers.get("Retry-After") if exc.headers else None,
+            ) from exc
+        raise HuldraMetadataError(
+            f"Huldra {path} returned HTTP {exc.code}: {_http_error_body(exc)}"
+        ) from exc
+    except (TimeoutError, urllib.error.URLError) as exc:
+        raise HuldraMetadataError(f"Huldra {path} request failed: {exc}") from exc
+
+    try:
+        decoded = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HuldraMetadataError(f"Huldra {path} returned invalid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise HuldraMetadataError(f"Huldra {path} returned a non-object JSON payload")
+    return decoded
+
+
+def _raise_for_huldra_rate_limit(
+    payload: Mapping[str, Any],
+    *,
+    stage: str,
+) -> None:
+    request_payloads = [
+        item
+        for item in payload.get("requests") or []
+        if isinstance(item, Mapping)
+    ]
+    candidates: list[Mapping[str, Any]] = [*request_payloads, payload]
+    for item in candidates:
+        if _huldra_item_is_rate_limited(item):
+            raise ArxivMetadataRateLimitError(
+                _huldra_failure_message(
+                    f"Huldra {stage} returned rate-limit/cooldown",
+                    item,
+                    sync_result=payload if item is not payload else None,
+                ),
+                retry_after=_huldra_retry_after(payload),
+            )
+
+
+def _huldra_item_is_rate_limited(item: Mapping[str, Any]) -> bool:
+    statuses = {
+        str(item.get("status") or "").lower(),
+        str(item.get("raw_cache_status") or "").lower(),
+        str(item.get("serving_status") or "").lower(),
+    }
+    reasons = {
+        str(item.get("blocked_reason") or "").lower(),
+        str(item.get("error_category") or "").lower(),
+    }
+    upstream_status = item.get("upstream_status")
+    return (
+        bool({"cooling_down", "rate_limited"} & statuses)
+        or ("skipped" in statuses and "cooldown" in reasons)
+        or bool({"cooldown", "rate_limited"} & reasons)
+        or str(upstream_status) == "429"
+        or bool(item.get("cooldown_active"))
+        or int(item.get("cooldown_active_total") or 0) > 0
+        or int(item.get("rate_limited_windows_total") or 0) > 0
+        or int(item.get("upstream_429_total") or 0) > 0
+    )
+
+
+def _huldra_retry_after(payload: Mapping[str, Any]) -> str | None:
+    value = payload.get("retry_after_seconds")
+    return str(value) if value is not None else None
+
+
+def _huldra_failure_message(
+    prefix: str,
+    payload: Mapping[str, Any],
+    *,
+    sync_result: Mapping[str, Any] | None = None,
+) -> str:
+    status = (
+        payload.get("status")
+        or payload.get("raw_cache_status")
+        or payload.get("serving_status")
+        or "unknown"
+    )
+    cache_key = payload.get("cache_key") or _first_huldra_request_value(
+        sync_result,
+        "cache_key",
+    )
+    blocked_reason = (
+        payload.get("blocked_reason")
+        or payload.get("error_category")
+        or _first_huldra_request_value(sync_result, "blocked_reason")
+        or _first_huldra_request_value(sync_result, "error_category")
+        or "not_provided"
+    )
+    details = [
+        f"status={status}",
+        f"cache_key={cache_key or 'unknown'}",
+        f"blocked_reason={blocked_reason}",
+    ]
+    upstream_status = payload.get("upstream_status") or _first_huldra_request_value(
+        sync_result,
+        "upstream_status",
+    )
+    if upstream_status is not None:
+        details.append(f"upstream_status={upstream_status}")
+    cooldown_until = payload.get("cooldown_until") or (
+        sync_result.get("cooldown_until") if sync_result is not None else None
+    )
+    if cooldown_until is not None:
+        details.append(f"cooldown_until={cooldown_until}")
+    if sync_result is not None:
+        sync_status = _first_huldra_request_value(sync_result, "raw_cache_status")
+        if sync_status is not None:
+            details.append(f"sync_raw_cache_status={sync_status}")
+    return f"{prefix}: " + " ".join(details)
+
+
+def _first_huldra_request_value(
+    payload: Mapping[str, Any] | None,
+    key: str,
+) -> Any | None:
+    if payload is None:
+        return None
+    requests = payload.get("requests")
+    if not isinstance(requests, list) or not requests:
+        return None
+    first = requests[0]
+    if not isinstance(first, Mapping):
+        return None
+    return first.get(key)
+
+
+def _arxiv_paper_from_huldra_payload(payload: Mapping[str, Any]) -> ArxivPaper | None:
+    versioned_arxiv_id = str(payload.get("arxiv_id") or "").strip()
+    arxiv_id = strip_arxiv_version(versioned_arxiv_id)
+    title = _normalize_space(str(payload.get("title") or ""))
+    if not arxiv_id or not title:
+        return None
+    categories = payload.get("categories")
+    authors = payload.get("authors")
+    doi = payload.get("doi")
+    return ArxivPaper(
+        arxiv_id=arxiv_id,
+        versioned_arxiv_id=versioned_arxiv_id,
+        title=title,
+        abstract=str(payload.get("abstract") or ""),
+        primary_category=str(payload.get("primary_category") or ""),
+        categories=[
+            str(category)
+            for category in categories
+            if str(category)
+        ]
+        if isinstance(categories, list)
+        else [],
+        published_at=str(payload.get("published_at") or ""),
+        updated_at=str(payload.get("updated_at") or ""),
+        doi=str(doi) if doi else None,
+        authors=tuple(str(author) for author in authors)
+        if isinstance(authors, list)
+        else (),
+    )
 
 
 def fetch_citation_matches(
@@ -1232,6 +1624,14 @@ def _work_mentions_arxiv_id(payload: dict[str, Any], arxiv_id: str) -> bool:
             if isinstance(location, dict):
                 haystacks.extend(str(value).lower() for value in location.values())
     return any(needle in value for value in haystacks)
+
+
+def _http_error_body(exc: urllib.error.HTTPError) -> str:
+    try:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        return exc.reason or exc.msg or ""
+    return body[:500] if body else (exc.reason or exc.msg or "")
 
 
 def _read_json_or_none(

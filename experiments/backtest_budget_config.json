@@ -3,7 +3,7 @@
   "currency": "USD",
   "rate_assumption_note": "Planning estimates only. Replace with the actual OpenAI-compatible endpoint rate card before any paid run; Batch/Flex discounts are configurable estimates, not guaranteed spend.",
   "model_name_policy": {
-    "require_provider_prefix": true,
+    "require_provider_prefix": false,
     "availability_check_required_before_paid_run": true
   },
   "pairwise_budget_ablation": {
@@ -19,17 +19,11 @@
     "metrics_artifact": "pairwise_budget_ablation_metrics.csv"
   },
   "rate_card": {
-    "openai/gpt-5.4-mini": {
+    "gpt-5.4-mini": {
       "input_usd_per_1m_tokens": 0.25,
       "output_usd_per_1m_tokens": 2.0,
       "discount_multiplier": 1.0,
       "note": "Cheap-model placeholder estimate for abstract-level pointwise and pairwise passes."
-    },
-    "openai/gpt-5.4": {
-      "input_usd_per_1m_tokens": 3.0,
-      "output_usd_per_1m_tokens": 15.0,
-      "discount_multiplier": 1.0,
-      "note": "Stronger-model placeholder estimate for judge-quality audit only."
     }
   },
   "token_assumptions": {
@@ -50,9 +44,9 @@
     {
       "name": "smoke",
       "allocation_fraction": 0.05,
-      "pointwise_model": "openai/gpt-5.4-mini",
-      "pairwise_model": "openai/gpt-5.4-mini",
-      "audit_model": "openai/gpt-5.4",
+      "pointwise_model": "gpt-5.4-mini",
+      "pairwise_model": "gpt-5.4-mini",
+      "audit_model": "gpt-5.4-mini",
       "strategies": [
         "random",
         "semantic_baseline",
@@ -73,9 +67,9 @@
     {
       "name": "pilot",
       "allocation_fraction": 0.25,
-      "pointwise_model": "openai/gpt-5.4-mini",
-      "pairwise_model": "openai/gpt-5.4-mini",
-      "audit_model": "openai/gpt-5.4",
+      "pointwise_model": "gpt-5.4-mini",
+      "pairwise_model": "gpt-5.4-mini",
+      "audit_model": "gpt-5.4-mini",
       "strategies": [
         "random",
         "semantic_baseline",
@@ -102,9 +96,9 @@
     {
       "name": "main",
       "allocation_fraction": 0.55,
-      "pointwise_model": "openai/gpt-5.4-mini",
-      "pairwise_model": "openai/gpt-5.4-mini",
-      "audit_model": "openai/gpt-5.4",
+      "pointwise_model": "gpt-5.4-mini",
+      "pairwise_model": "gpt-5.4-mini",
+      "audit_model": "gpt-5.4-mini",
       "strategies": [
         "random",
         "semantic_baseline",
@@ -131,9 +125,9 @@
     {
       "name": "audit",
       "allocation_fraction": 0.1,
-      "pointwise_model": "openai/gpt-5.4-mini",
-      "pairwise_model": "openai/gpt-5.4-mini",
-      "audit_model": "openai/gpt-5.4",
+      "pointwise_model": "gpt-5.4-mini",
+      "pairwise_model": "gpt-5.4-mini",
+      "audit_model": "gpt-5.4-mini",
       "strategies": [],
       "buckets": [],
       "audit_pairwise_calls": 250
@@ -141,9 +135,9 @@
     {
       "name": "reserve",
       "allocation_fraction": 0.05,
-      "pointwise_model": "openai/gpt-5.4-mini",
-      "pairwise_model": "openai/gpt-5.4-mini",
-      "audit_model": "openai/gpt-5.4",
+      "pointwise_model": "gpt-5.4-mini",
+      "pairwise_model": "gpt-5.4-mini",
+      "audit_model": "gpt-5.4-mini",
       "strategies": [],
       "buckets": [],
       "audit_pairwise_calls": 0

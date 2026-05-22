@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal, Mapping
 
 from sestina.aggregation import aggregate
 from sestina.backtest import Prediction, compare_strategies
@@ -75,9 +75,18 @@ class LedgerEntry:
     artifact_path: str
     created_at_unix: float
     prompt_version: str = PROMPT_VERSION
+    billable_cost_usd: float | None = None
+    cost_source: str = "configured_token_estimate"
+    upstream_usage: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        estimated_cost = round(self.estimated_cost_usd, 6)
+        billable_cost = (
+            estimated_cost
+            if self.billable_cost_usd is None
+            else round(self.billable_cost_usd, 6)
+        )
+        payload = {
             "phase": self.phase,
             "bucket": self.bucket,
             "model": self.model,
@@ -91,7 +100,12 @@ class LedgerEntry:
             "artifact_path": self.artifact_path,
             "prompt_version": self.prompt_version,
             "created_at_unix": round(self.created_at_unix, 3),
+            "billable_cost_usd": billable_cost,
+            "cost_source": self.cost_source,
         }
+        if self.upstream_usage:
+            payload["upstream_usage"] = self.upstream_usage
+        return payload
 
 
 @dataclass(slots=True)
@@ -107,7 +121,12 @@ class JsonlLedger:
                 continue
             entry = json.loads(line)
             if str(entry.get("status")) in PAID_STATUS_VALUES:
-                total += float(entry.get("estimated_cost_usd") or 0.0)
+                total += float(
+                    entry.get("billable_cost_usd")
+                    if entry.get("billable_cost_usd") is not None
+                    else entry.get("estimated_cost_usd")
+                    or 0.0
+                )
         return round(total, 6)
 
     def append(self, entry: LedgerEntry) -> None:
@@ -126,6 +145,13 @@ class CallEstimate:
     input_tokens: int
     output_tokens: int
     cost_usd: float
+
+
+@dataclass(frozen=True, slots=True)
+class ChatJsonResponse:
+    content: dict[str, Any]
+    upstream_usage: dict[str, Any]
+    upstream_cost_usd: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,10 +180,9 @@ UrlOpen = Callable[..., Any]
 
 def validate_model_names(models: Iterable[str]) -> None:
     for model in sorted(set(models)):
-        if "/" not in model:
+        if not model.strip():
             raise ModelAvailabilityError(
-                "model names must include a provider prefix; "
-                f"OpenAI-routed models should look like openai/{model}"
+                "model names must be non-empty before paid use"
             )
 
 
@@ -824,6 +849,23 @@ def _chat_json(
     timeout_seconds: float,
     urlopen: UrlOpen,
 ) -> dict[str, Any]:
+    return _chat_json_with_usage(
+        base_url=base_url,
+        api_key=api_key,
+        payload=payload,
+        timeout_seconds=timeout_seconds,
+        urlopen=urlopen,
+    ).content
+
+
+def _chat_json_with_usage(
+    *,
+    base_url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    timeout_seconds: float,
+    urlopen: UrlOpen,
+) -> ChatJsonResponse:
     request = urllib.request.Request(
         base_url.rstrip("/") + "/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -839,7 +881,11 @@ def _chat_json(
     except urllib.error.URLError as exc:
         raise RuntimeError(f"LLM request failed: {type(exc).__name__}") from exc
     content = response_payload["choices"][0]["message"]["content"]
-    return json.loads(content)
+    return ChatJsonResponse(
+        content=json.loads(content),
+        upstream_usage=_usage_payload(response_payload),
+        upstream_cost_usd=_upstream_cost_usd(response_payload),
+    )
 
 
 def _pointwise_payload(*, model: str, paper: Paper) -> dict[str, Any]:
@@ -969,6 +1015,104 @@ def _comparison_from_pairwise_response(
     )
 
 
+def _usage_payload(response_payload: dict[str, Any]) -> dict[str, Any]:
+    usage = response_payload.get("usage")
+    if not isinstance(usage, dict):
+        return {}
+    allowed = {}
+    for key, value in usage.items():
+        if isinstance(value, int | float | str | bool) or value is None:
+            allowed[str(key)] = value
+    return allowed
+
+
+def _upstream_cost_usd(response_payload: dict[str, Any]) -> float | None:
+    usage = response_payload.get("usage")
+    candidates: list[Any] = []
+    if isinstance(usage, dict):
+        candidates.extend(
+            usage.get(key)
+            for key in (
+                "cost",
+                "cost_usd",
+                "total_cost",
+                "total_cost_usd",
+                "estimated_cost",
+                "estimated_cost_usd",
+            )
+        )
+    candidates.extend(
+        response_payload.get(key)
+        for key in (
+            "cost",
+            "cost_usd",
+            "total_cost",
+            "total_cost_usd",
+            "estimated_cost",
+            "estimated_cost_usd",
+        )
+    )
+    for value in candidates:
+        if isinstance(value, int | float):
+            return round(float(value), 6)
+        if isinstance(value, str):
+            try:
+                return round(float(value), 6)
+            except ValueError:
+                continue
+    return None
+
+
+def usage_cost_payload(
+    *,
+    model: str,
+    estimate: CallEstimate,
+    rates: dict[str, dict[str, float]],
+    response: ChatJsonResponse | None,
+) -> dict[str, Any]:
+    """Return ledger-safe cost metadata for a completed or attempted call."""
+    if response is not None and response.upstream_cost_usd is not None:
+        return {
+            "billable_cost_usd": response.upstream_cost_usd,
+            "cost_source": "upstream_returned_cost",
+            "upstream_usage": response.upstream_usage,
+        }
+
+    usage = response.upstream_usage if response is not None else {}
+    input_tokens = _usage_token_value(usage, "prompt_tokens", "input_tokens")
+    output_tokens = _usage_token_value(
+        usage,
+        "completion_tokens",
+        "output_tokens",
+    )
+    if input_tokens is not None and output_tokens is not None:
+        rate = rates.get(model)
+        if rate is not None:
+            cost = (
+                ((input_tokens / 1_000_000) * rate["input_usd_per_1m_tokens"])
+                + ((output_tokens / 1_000_000) * rate["output_usd_per_1m_tokens"])
+            ) * rate["discount_multiplier"]
+            return {
+                "billable_cost_usd": round(cost, 6),
+                "cost_source": "upstream_returned_usage_configured_rates",
+                "upstream_usage": usage,
+            }
+
+    return {
+        "billable_cost_usd": estimate.cost_usd,
+        "cost_source": "configured_token_estimate_no_upstream_usage",
+        "upstream_usage": usage,
+    }
+
+
+def _usage_token_value(usage: Mapping[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        value = usage.get(key)
+        if isinstance(value, int | float):
+            return max(0, int(value))
+    return None
+
+
 def _extract_model_ids(payload: dict[str, Any]) -> set[str]:
     data = payload.get("data")
     if not isinstance(data, list):
@@ -1072,7 +1216,9 @@ def _ledger_entry(
     estimate: CallEstimate,
     status: str,
     artifact_path: Path,
+    cost_payload: Mapping[str, Any] | None = None,
 ) -> LedgerEntry:
+    cost_payload = cost_payload or {}
     return LedgerEntry(
         phase=phase,
         bucket=bucket,
@@ -1084,6 +1230,19 @@ def _ledger_entry(
         status=status,
         artifact_path=str(artifact_path),
         created_at_unix=time.time(),
+        billable_cost_usd=(
+            float(cost_payload["billable_cost_usd"])
+            if cost_payload.get("billable_cost_usd") is not None
+            else None
+        ),
+        cost_source=str(
+            cost_payload.get("cost_source") or "configured_token_estimate"
+        ),
+        upstream_usage=(
+            dict(cost_payload.get("upstream_usage") or {})
+            if cost_payload.get("upstream_usage") is not None
+            else None
+        ),
     )
 
 
@@ -1098,7 +1257,9 @@ def _call_artifact(
     subject: dict[str, Any],
     response: dict[str, Any] | None = None,
     error: BaseException | None = None,
+    cost_payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    cost_payload = cost_payload or {}
     artifact = {
         "artifact_type": "sestina-backtest-call",
         "phase": phase,
@@ -1113,7 +1274,16 @@ def _call_artifact(
         "estimated_cost_usd": estimate.cost_usd,
         "status": status,
         "subject": subject,
+        "billable_cost_usd": round(
+            float(cost_payload.get("billable_cost_usd") or estimate.cost_usd),
+            6,
+        ),
+        "cost_source": str(
+            cost_payload.get("cost_source") or "configured_token_estimate"
+        ),
     }
+    if cost_payload.get("upstream_usage"):
+        artifact["upstream_usage"] = dict(cost_payload["upstream_usage"])
     if response is not None:
         artifact["response"] = response
     if error is not None:

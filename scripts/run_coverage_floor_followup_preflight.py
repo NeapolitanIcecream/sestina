@@ -28,7 +28,7 @@ from sestina.backtest_runner import (  # noqa: E402
     ModelAvailabilityError,
     _call_artifact,
     _call_estimate,
-    _chat_json,
+    _chat_json_with_usage,
     _comparison_from_pairwise_response,
     _config_for_phase,
     _ledger_entry,
@@ -37,6 +37,7 @@ from sestina.backtest_runner import (  # noqa: E402
     _pairwise_payload,
     check_model_availability,
     load_dataset_manifest,
+    usage_cost_payload,
     validate_model_names,
 )
 from sestina.candidates import select_candidates  # noqa: E402
@@ -101,7 +102,7 @@ DEFAULT_SOURCE_ARTIFACT_DIR = (
 DEFAULT_OUTPUT = DEFAULT_OUTPUT_DIR / "coverage-floor-followup-preflight.json"
 DEFAULT_LEDGER = DEFAULT_OUTPUT_DIR / "coverage-floor-followup-ledger.jsonl"
 DEFAULT_PLANNED_PAIRS = DEFAULT_OUTPUT_DIR / "planned-pair-occurrences.jsonl"
-DEFAULT_MAX_USD = 2.0
+DEFAULT_MAX_USD = round(DEFAULT_PAID_CAP_USD - CURRENT_KNOWN_SPEND_USD, 6)
 REQUIRED_TOP_LEVEL_KEYS = {
     "artifact_type",
     "schema_version",
@@ -309,6 +310,14 @@ def build_coverage_floor_followup_preflight(
             "pointwise_calls_made": 0,
         }
 
+    existing_pairwise_artifacts, existing_pairwise_artifact_report = (
+        _existing_pairwise_artifacts(artifact_dir=artifact_dir, phase=phase_name)
+    )
+    if planned_rows:
+        planned_rows = _mark_cached_pairwise_rows(
+            planned_rows,
+            existing_pairwise_artifacts=existing_pairwise_artifacts,
+        )
     planned_stats = _planned_pair_stats(planned_rows)
     estimated_additional_spend = round(
         planned_stats["unique_missing_pairwise_labels"] * pairwise_estimate.cost_usd,
@@ -318,6 +327,11 @@ def build_coverage_floor_followup_preflight(
     projected_ledger_spend = round(
         existing_ledger_spend + estimated_additional_spend,
         6,
+    )
+    resume_state = _pairwise_resume_state(
+        ledger_path=ledger_path,
+        existing_pairwise_artifact_paths=set(existing_pairwise_artifacts.values()),
+        existing_pairwise_artifact_report=existing_pairwise_artifact_report,
     )
     if planned_rows:
         _write_jsonl(planned_pairs_output_path, planned_rows)
@@ -341,6 +355,8 @@ def build_coverage_floor_followup_preflight(
             "known_spend_before_validation_usd": CURRENT_KNOWN_SPEND_USD,
             "pointwise_calls_planned": 0,
             "explicit_pointwise_approval": False,
+            "standing_campaign_authorization": True,
+            "fresh_holdout_pointwise_artifacts_authorized": True,
             "historical_paid_artifacts_immutable": True,
         },
     )
@@ -374,6 +390,7 @@ def build_coverage_floor_followup_preflight(
         existing_ledger_spend=existing_ledger_spend,
         estimated_additional_spend=estimated_additional_spend,
         projected_ledger_spend=projected_ledger_spend,
+        resume_state=resume_state,
         protocol=protocol,
         guarded_execution=guarded_execution,
     )
@@ -405,6 +422,7 @@ def build_coverage_floor_followup_preflight(
             max_usd=max_usd,
             pairwise_model=pairwise_model,
             pairwise_estimate=pairwise_estimate,
+            rates=rates,
             timeout_seconds=timeout_seconds,
             urlopen=urlopen,
         )
@@ -494,6 +512,7 @@ def build_coverage_floor_followup_preflight(
             "spend_usd_after_workflow": JsonlLedger(ledger_path).existing_spend_usd(),
             "historical_ledgers_rewritten": False,
         },
+        "resume_state": resume_state,
         "max_usd_cap": {
             "requested_max_usd": max_usd,
             "cap_policy_max_usd": DEFAULT_MAX_USD,
@@ -545,7 +564,9 @@ def validate_coverage_floor_preflight_artifact_schema(
             raise ValueError("planning preflight must spend zero USD")
     cap = (payload.get("max_usd_cap") or {}).get("requested_max_usd")
     if not isinstance(cap, int | float) or not (0.0 < float(cap) <= DEFAULT_MAX_USD):
-        raise ValueError("coverage-floor preflight max-usd cap must be in (0, 2]")
+        raise ValueError(
+            "coverage-floor preflight max-usd cap must be within campaign remaining"
+        )
     final = payload.get("final_go_no_go")
     if not isinstance(final, Mapping):
         raise ValueError("coverage-floor preflight final_go_no_go must be an object")
@@ -688,8 +709,8 @@ def _fresh_holdout_state(
             "existing_tool": "scripts/build_arxiv_historical_manifest.py",
             "can_build_after_predeclared_bucket_specs": True,
             "not_run_by_preflight_reason": (
-                "no predeclared fresh bucket specification is checked in for "
-                "this follow-up, and pointwise calls are not approved here"
+                "manifest construction is handled by the autonomous fresh "
+                "holdout design/build step before this pairwise-only preflight"
             ),
             "reproduction_command_template": builder_command,
         },
@@ -886,6 +907,7 @@ def _guardrails(
     existing_ledger_spend: float,
     estimated_additional_spend: float,
     projected_ledger_spend: float,
+    resume_state: Mapping[str, Any],
     protocol: Mapping[str, Any],
     guarded_execution: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -927,11 +949,17 @@ def _guardrails(
         "separate_artifact_directory": artifact_dir.resolve()
         != source_artifact_dir.resolve(),
         "historical_ledgers_not_rewritten": True,
-        "hard_max_usd_cap_lte_2": 0.0 < max_usd <= DEFAULT_MAX_USD,
+        "hard_max_usd_cap_within_campaign_remaining": (
+            0.0 < max_usd <= DEFAULT_MAX_USD
+        ),
         "hard_max_usd_cap_lte_paid_cap": max_usd <= DEFAULT_PAID_CAP_USD,
         "estimated_additional_spend_lte_cap": estimated_additional_spend <= max_usd,
         "projected_ledger_spend_lte_cap": projected_ledger_spend <= max_usd,
-        "existing_planned_ledger_spend_zero": existing_ledger_spend == 0.0,
+        "projected_campaign_total_lte_paid_cap": (
+            CURRENT_KNOWN_SPEND_USD + projected_ledger_spend <= DEFAULT_PAID_CAP_USD
+        ),
+        "existing_planned_ledger_resumable": existing_ledger_spend == 0.0
+        or resume_state.get("resumable") is True,
         "planned_rows_pairwise_only": planned_stats["pointwise_like_planned_rows"]
         == 0
         and planned_stats["non_pairwise_call_rows"] == 0,
@@ -1063,6 +1091,7 @@ def _execute_pairwise_only(
     max_usd: float,
     pairwise_model: str,
     pairwise_estimate: Any,
+    rates: dict[str, dict[str, float]],
     timeout_seconds: float,
     urlopen: UrlOpen,
 ) -> dict[str, Any]:
@@ -1092,7 +1121,7 @@ def _execute_pairwise_only(
             cap_usd=max_usd,
             next_cost_usd=pairwise_estimate.cost_usd,
         )
-        response = _chat_json(
+        response = _chat_json_with_usage(
             base_url=os.environ.get("SESTINA_LLM_BASE_URL") or "",
             api_key=os.environ.get("SESTINA_LLM_API_KEY") or "",
             payload=_pairwise_payload(
@@ -1103,7 +1132,13 @@ def _execute_pairwise_only(
             timeout_seconds=timeout_seconds,
             urlopen=urlopen,
         )
-        comparison = _comparison_from_pairwise_response(pair, response)
+        comparison = _comparison_from_pairwise_response(pair, response.content)
+        cost_payload = usage_cost_payload(
+            model=pairwise_model,
+            estimate=pairwise_estimate,
+            rates=rates,
+            response=response,
+        )
         artifact_path = (
             artifact_dir
             / phase
@@ -1121,9 +1156,10 @@ def _execute_pairwise_only(
             model=pairwise_model,
             estimate=pairwise_estimate,
             status="ok",
-            response=response,
+            response=response.content,
             comparison=comparison,
             ledger=ledger,
+            cost_payload=cost_payload,
             subject={
                 "left_id": left_id,
                 "right_id": right_id,
@@ -1152,6 +1188,7 @@ def _write_pairwise_call_artifact(
     response: dict[str, Any] | None = None,
     comparison: PairwiseComparison | None = None,
     subject: dict[str, Any] | None = None,
+    cost_payload: Mapping[str, Any] | None = None,
 ) -> None:
     _assert_pairwise_only_call_kind(PAIRWISE_CALL_KIND)
     artifact = _call_artifact(
@@ -1167,7 +1204,10 @@ def _write_pairwise_call_artifact(
             "left_id": comparison.left_id if comparison is not None else None,
             "right_id": comparison.right_id if comparison is not None else None,
         },
+        cost_payload=cost_payload,
     )
+    if comparison is not None:
+        artifact["comparison"] = comparison.to_dict()
     write_json_artifact(artifact_path, artifact)
     ledger.append(
         _ledger_entry(
@@ -1178,6 +1218,7 @@ def _write_pairwise_call_artifact(
             estimate=estimate,
             status=status,
             artifact_path=artifact_path,
+            cost_payload=cost_payload,
         )
     )
 
@@ -1235,6 +1276,134 @@ def _provider_model_availability(
         "api_key_env_present": bool(os.environ.get("SESTINA_LLM_API_KEY")),
         "base_url_env_present": bool(os.environ.get("SESTINA_LLM_BASE_URL")),
         "secrets_printed_or_stored": False,
+    }
+
+
+def _existing_pairwise_artifacts(
+    *,
+    artifact_dir: Path,
+    phase: str,
+) -> tuple[dict[tuple[str, tuple[str, str]], Path], dict[str, Any]]:
+    artifacts: dict[tuple[str, tuple[str, str]], Path] = {}
+    invalid_json = 0
+    invalid_payload = 0
+    duplicate_keys = 0
+    calls_root = artifact_dir / phase
+    for path in sorted(calls_root.glob(f"*/calls/*-{PAIRWISE_CALL_KIND}-*.json")):
+        try:
+            payload = _read_json(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            invalid_json += 1
+            continue
+        if payload.get("kind") != PAIRWISE_CALL_KIND or payload.get("status") != "ok":
+            invalid_payload += 1
+            continue
+        bucket = str(payload.get("bucket") or "")
+        subject = _mapping(payload.get("subject"))
+        comparison = _mapping(payload.get("comparison"))
+        left_id = str(subject.get("left_id") or comparison.get("left_id") or "")
+        right_id = str(subject.get("right_id") or comparison.get("right_id") or "")
+        if not bucket or not left_id or not right_id:
+            invalid_payload += 1
+            continue
+        key = (bucket, canonical_pair_key(left_id, right_id))
+        if key in artifacts:
+            duplicate_keys += 1
+            continue
+        artifacts[key] = path
+    return artifacts, {
+        "artifact_count": len(artifacts),
+        "invalid_json_files": invalid_json,
+        "invalid_payload_files": invalid_payload,
+        "duplicate_pair_keys": duplicate_keys,
+    }
+
+
+def _mark_cached_pairwise_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    existing_pairwise_artifacts: Mapping[tuple[str, tuple[str, str]], Path],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        marked = dict(row)
+        pair_key = row.get("pair_key")
+        if _valid_pair_key(pair_key):
+            key = (
+                str(row.get("bucket") or ""),
+                canonical_pair_key(str(pair_key[0]), str(pair_key[1])),  # type: ignore[index]
+            )
+            artifact_path = existing_pairwise_artifacts.get(key)
+            if artifact_path is not None:
+                marked["cache_status"] = "cached_reuse"
+                marked["cached_artifact_path"] = str(artifact_path)
+                marked["cached_artifact_kind"] = PAIRWISE_CALL_KIND
+        output.append(marked)
+    return output
+
+
+def _pairwise_resume_state(
+    *,
+    ledger_path: Path,
+    existing_pairwise_artifact_paths: set[Path],
+    existing_pairwise_artifact_report: Mapping[str, Any],
+) -> dict[str, Any]:
+    resolved_artifacts = {_safe_resolve(path) for path in existing_pairwise_artifact_paths}
+    ledger_entries = 0
+    invalid_json_lines = 0
+    non_pairwise_entries = 0
+    pointwise_like_entries = 0
+    non_ok_entries = 0
+    missing_artifact_entries = 0
+    artifact_not_indexed_entries = 0
+    if ledger_path.exists():
+        for line in ledger_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            ledger_entries += 1
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                invalid_json_lines += 1
+                continue
+            kind = str(row.get("kind") or "")
+            if kind != PAIRWISE_CALL_KIND:
+                non_pairwise_entries += 1
+            if "pointwise" in kind.lower():
+                pointwise_like_entries += 1
+            if row.get("status") != "ok":
+                non_ok_entries += 1
+            artifact_path = Path(str(row.get("artifact_path") or ""))
+            if not artifact_path.is_file():
+                missing_artifact_entries += 1
+            elif _safe_resolve(artifact_path) not in resolved_artifacts:
+                artifact_not_indexed_entries += 1
+    resumable = (
+        invalid_json_lines == 0
+        and non_pairwise_entries == 0
+        and pointwise_like_entries == 0
+        and non_ok_entries == 0
+        and missing_artifact_entries == 0
+        and artifact_not_indexed_entries == 0
+        and existing_pairwise_artifact_report.get("invalid_json_files") == 0
+        and existing_pairwise_artifact_report.get("invalid_payload_files") == 0
+    )
+    return {
+        "resumable": resumable,
+        "ledger_path": str(ledger_path),
+        "ledger_entries": ledger_entries,
+        "existing_pairwise_artifacts": dict(existing_pairwise_artifact_report),
+        "invalid_json_ledger_lines": invalid_json_lines,
+        "non_pairwise_ledger_entries": non_pairwise_entries,
+        "pointwise_like_ledger_entries": pointwise_like_entries,
+        "non_ok_ledger_entries": non_ok_entries,
+        "missing_artifact_ledger_entries": missing_artifact_entries,
+        "artifact_not_indexed_ledger_entries": artifact_not_indexed_entries,
+        "resume_policy": (
+            "existing ledger entries may be resumed only when every ledger row "
+            "is an ok pairwise_active call with a matching artifact under the "
+            "current artifact directory"
+        ),
     }
 
 
@@ -1451,6 +1620,13 @@ def _same_path(path: Path, other: object) -> bool:
         return path.resolve() == Path(str(other)).resolve()
     except OSError:
         return False
+
+
+def _safe_resolve(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:

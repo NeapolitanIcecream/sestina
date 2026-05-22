@@ -449,9 +449,12 @@ def _gate_verdict(
     if paid_allowed:
         recommendation = (
             "Paid follow-up is allowed by this no-paid gate only as a "
-            "pairwise-only run after a separate dry-run estimate, provider "
-            "model availability check, JSONL ledger, new artifact directory, "
-            "and hard --max-usd cap. Do not make pointwise calls."
+            "guarded pairwise-only validation run after a separate dry-run "
+            "estimate, provider model availability check, JSONL ledger, new "
+            "artifact directory, and hard --max-usd cap. Fresh-holdout "
+            "pointwise artifact generation is governed separately by the "
+            "standing autonomous campaign policy and must stay scoped to that "
+            "fresh holdout."
         )
     else:
         recommendation = (

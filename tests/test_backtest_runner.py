@@ -9,10 +9,13 @@ import pytest
 from sestina.backtest_runner import (
     BacktestRunner,
     BudgetLimitExceeded,
+    CallEstimate,
+    ChatJsonResponse,
     JsonlLedger,
     LedgerEntry,
     ModelAvailabilityError,
     check_model_availability,
+    usage_cost_payload,
 )
 
 
@@ -74,14 +77,22 @@ def test_runner_defaults_to_dry_run_without_model_check_or_ledger_calls(
     assert (tmp_path / "artifacts" / "estimate-smoke.json").exists()
 
 
-def test_model_availability_requires_provider_prefix() -> None:
-    with pytest.raises(ModelAvailabilityError, match="provider prefix"):
-        check_model_availability(
-            base_url="https://llm.example/v1",
-            api_key="secret",
-            models=["gpt-5.4-mini"],
-            urlopen=lambda *args, **kwargs: _FakeResponse({"data": []}),
-        )
+def test_model_availability_allows_unprefixed_model_names() -> None:
+    result = check_model_availability(
+        base_url="https://llm.example/v1",
+        api_key="secret",
+        models=["gpt-5.4-mini"],
+        urlopen=lambda *args, **kwargs: _FakeResponse(
+            {"data": [{"id": "gpt-5.4-mini"}]}
+        ),
+    )
+
+    assert result == {
+        "status": "available",
+        "requested_models": ["gpt-5.4-mini"],
+        "missing_models": [],
+        "available_requested_models": ["gpt-5.4-mini"],
+    }
 
 
 def test_model_availability_rejects_missing_endpoint_model() -> None:
@@ -144,9 +155,62 @@ def test_jsonl_ledger_writes_required_call_fields_and_totals_spend(
     assert entry["kind"] == "pointwise"
     assert entry["estimated_tokens"] == {"input": 900, "output": 220}
     assert entry["estimated_cost_usd"] == 0.123456
+    assert entry["billable_cost_usd"] == 0.123456
+    assert entry["cost_source"] == "configured_token_estimate"
     assert entry["status"] == "ok"
     assert entry["artifact_path"].endswith("call.json")
     assert ledger.existing_spend_usd() == pytest.approx(0.123456)
+
+
+def test_ledger_prefers_billable_cost_when_upstream_usage_is_recorded(
+    tmp_path: Path,
+) -> None:
+    ledger = JsonlLedger(tmp_path / "ledger.jsonl")
+
+    ledger.append(
+        LedgerEntry(
+            phase="smoke",
+            bucket="bucket-a",
+            model="openai/mini",
+            kind="pointwise",
+            estimated_input_tokens=900,
+            estimated_output_tokens=220,
+            estimated_cost_usd=0.50,
+            billable_cost_usd=0.12,
+            cost_source="upstream_returned_usage_configured_rates",
+            upstream_usage={"prompt_tokens": 100, "completion_tokens": 10},
+            status="ok",
+            artifact_path=str(tmp_path / "call.json"),
+            created_at_unix=1.0,
+        )
+    )
+
+    entry = json.loads((tmp_path / "ledger.jsonl").read_text())
+    assert entry["billable_cost_usd"] == 0.12
+    assert entry["upstream_usage"] == {"prompt_tokens": 100, "completion_tokens": 10}
+    assert ledger.existing_spend_usd() == pytest.approx(0.12)
+
+
+def test_usage_cost_payload_estimates_from_returned_usage_and_configured_rates() -> None:
+    payload = usage_cost_payload(
+        model="openai/mini",
+        estimate=CallEstimate(input_tokens=900, output_tokens=220, cost_usd=0.50),
+        rates={
+            "openai/mini": {
+                "input_usd_per_1m_tokens": 1.0,
+                "output_usd_per_1m_tokens": 2.0,
+                "discount_multiplier": 1.0,
+            }
+        },
+        response=ChatJsonResponse(
+            content={"ok": True},
+            upstream_usage={"prompt_tokens": 1000, "completion_tokens": 200},
+            upstream_cost_usd=None,
+        ),
+    )
+
+    assert payload["cost_source"] == "upstream_returned_usage_configured_rates"
+    assert payload["billable_cost_usd"] == pytest.approx(0.0014)
 
 
 def test_budget_guard_stops_before_projected_spend_exceeds_cap(

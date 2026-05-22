@@ -188,9 +188,13 @@ def test_unknown_strategy_is_rejected() -> None:
         estimate_from_config(config)
 
 
-def test_unprefixed_model_name_is_rejected_before_paid_run() -> None:
+def test_provider_prefix_policy_can_still_reject_unprefixed_model_names() -> None:
     config = {
         "budget_cap_usd": 1.0,
+        "model_name_policy": {
+            "require_provider_prefix": True,
+            "availability_check_required_before_paid_run": True,
+        },
         "rate_card": {
             "gpt-5.4-mini": {
                 "input_usd_per_1m_tokens": 1.0,

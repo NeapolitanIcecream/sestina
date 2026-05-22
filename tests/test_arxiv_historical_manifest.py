@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 from datetime import date
 from email.message import Message
 
+import pytest
+
 from scripts.build_arxiv_historical_manifest import (
+    ARXIV_API_URL,
+    ArxivMetadataRateLimitError,
     ArxivPacingConfig,
     ArxivPaper,
     ArxivRequestPacer,
     BucketSpec,
     CitationMatch,
     DateBucket,
+    HuldraMetadataError,
     assign_citation_labels,
     build_manifest_from_records,
     combine_manifests,
@@ -64,6 +70,80 @@ class _FakeBytesResponse:
 
     def read(self) -> bytes:
         return self.body
+
+
+def _fake_json_response(payload: dict) -> _FakeBytesResponse:
+    return _FakeBytesResponse(json.dumps(payload).encode("utf-8"))
+
+
+def _request_json(request: object) -> dict:
+    return json.loads(request.data.decode("utf-8"))  # type: ignore[attr-defined]
+
+
+def _request_path(request: object) -> str:
+    return urllib.parse.urlparse(request.full_url).path  # type: ignore[attr-defined]
+
+
+def _huldra_paper_payload() -> dict:
+    return {
+        "arxiv_id": "2304.00185v2",
+        "title": " Huldra Test Paper ",
+        "abstract": None,
+        "primary_category": "cs.LG",
+        "categories": ["cs.LG", "stat.ML"],
+        "published_at": "2023-04-05T00:00:00+00:00",
+        "updated_at": "2023-04-06T00:00:00+00:00",
+        "doi": "10.1234/huldra",
+        "authors": ["Ada Lovelace", "Grace Hopper"],
+    }
+
+
+def _run_successful_huldra_fetch() -> tuple[list[object], list[ArxivPaper]]:
+    requests: list[object] = []
+    responses = [
+        _fake_json_response(
+            {
+                "requested_total": 1,
+                "completed_windows_total": 1,
+                "requests": [
+                    {
+                        "cache_key": "huldra:v1:test",
+                        "raw_cache_status": "completed",
+                        "serving_status": "ready",
+                        "papers_total": 1,
+                    }
+                ],
+            }
+        ),
+        _fake_json_response(
+            {
+                "status": "ready",
+                "cache_key": "huldra:v1:test",
+                "papers": [_huldra_paper_payload()],
+                "papers_total": 1,
+                "analysis_ready": True,
+            }
+        ),
+    ]
+
+    def fake_urlopen(request: object, **kwargs: object) -> _FakeBytesResponse:
+        requests.append(request)
+        return responses.pop(0)
+
+    papers = fetch_arxiv_papers(
+        category="cs.LG",
+        start=date(2023, 4, 1),
+        end=date(2023, 4, 30),
+        limit=80,
+        metadata_source="huldra",
+        huldra_base_url="http://huldra.local",
+        huldra_wait_timeout_seconds=600,
+        huldra_client_id="test-client",
+        urlopen=fake_urlopen,
+    )
+
+    assert not responses
+    return requests, papers
 
 
 def test_citation_labels_select_top_k_without_reordering_bucket_membership() -> None:
@@ -269,6 +349,232 @@ def test_arxiv_feed_parser_extracts_title_abstract_categories_and_dates() -> Non
     assert papers[0].doi == "10.1234/example"
 
 
+def test_huldra_fetch_posts_sync_then_cache_only_request() -> None:
+    requests, _papers = _run_successful_huldra_fetch()
+
+    assert [_request_path(request) for request in requests] == [
+        "/v1/sync",
+        "/v1/requests",
+    ]
+    sync_body = _request_json(requests[0])
+    read_body = _request_json(requests[1])
+
+    assert sync_body["wait"] is True
+    assert sync_body["wait_timeout_seconds"] == 600
+    assert sync_body["requests"][0]["cache_policy"] == "cache_or_enqueue"
+    assert read_body["cache_policy"] == "cache_only"
+    assert read_body["readiness"] == "analysis_ready"
+
+
+def test_huldra_fetch_uses_category_query_and_exclusive_submitted_window() -> None:
+    requests, _papers = _run_successful_huldra_fetch()
+
+    huldra_request = _request_json(requests[0])["requests"][0]
+
+    assert huldra_request["search_query"] == "cat:cs.LG"
+    assert "submittedDate" not in huldra_request["search_query"]
+    assert huldra_request["submitted_start"] == "2023-04-01T00:00:00+00:00"
+    assert huldra_request["submitted_end"] == "2023-05-01T00:00:00+00:00"
+    assert huldra_request["sort_by"] == "submittedDate"
+    assert huldra_request["sort_order"] == "ascending"
+    assert huldra_request["max_results"] == 80
+
+
+def test_huldra_fetch_converts_paper_json_to_local_arxiv_paper() -> None:
+    _requests, papers = _run_successful_huldra_fetch()
+
+    assert len(papers) == 1
+    paper = papers[0]
+    assert paper.arxiv_id == "2304.00185"
+    assert paper.versioned_arxiv_id == "2304.00185v2"
+    assert paper.title == "Huldra Test Paper"
+    assert paper.abstract == ""
+    assert paper.primary_category == "cs.LG"
+    assert paper.categories == ["cs.LG", "stat.ML"]
+    assert paper.published_at == "2023-04-05T00:00:00+00:00"
+    assert paper.updated_at == "2023-04-06T00:00:00+00:00"
+    assert paper.doi == "10.1234/huldra"
+    assert paper.authors == ("Ada Lovelace", "Grace Hopper")
+
+
+@pytest.mark.parametrize(
+    "sync_request",
+    [
+        {
+            "cache_key": "huldra:v1:cooldown",
+            "raw_cache_status": "skipped",
+            "serving_status": "queued",
+            "error_category": "cooldown",
+            "cooldown_until": "2026-05-22T10:00:00+00:00",
+        },
+        {
+            "cache_key": "huldra:v1:rate-limited",
+            "raw_cache_status": "rate_limited",
+            "serving_status": "rate_limited",
+        },
+        {
+            "cache_key": "huldra:v1:upstream-429",
+            "raw_cache_status": "failed",
+            "serving_status": "failed",
+            "upstream_status": 429,
+        },
+    ],
+)
+def test_huldra_rate_limit_cooldown_and_upstream_429_are_rate_limit_failures(
+    sync_request: dict,
+) -> None:
+    def fake_urlopen(request: object, **kwargs: object) -> _FakeBytesResponse:
+        return _fake_json_response(
+            {
+                "requested_total": 1,
+                "upstream_429_total": 1
+                if sync_request.get("upstream_status") == 429
+                else 0,
+                "cooldown_active_total": 1
+                if sync_request.get("error_category") == "cooldown"
+                else 0,
+                "rate_limited_windows_total": 1
+                if sync_request.get("raw_cache_status") == "rate_limited"
+                else 0,
+                "requests": [sync_request],
+            }
+        )
+
+    with pytest.raises(ArxivMetadataRateLimitError) as exc_info:
+        fetch_arxiv_papers(
+            category="cs.LG",
+            start=date(2023, 4, 1),
+            end=date(2023, 4, 30),
+            limit=80,
+            metadata_source="huldra",
+            urlopen=fake_urlopen,
+        )
+
+    message = str(exc_info.value)
+    assert "rate-limit/cooldown" in message
+    assert f"cache_key={sync_request['cache_key']}" in message
+
+
+def test_huldra_cache_miss_reports_status_cache_key_and_blocked_reason() -> None:
+    responses = [
+        _fake_json_response(
+            {
+                "requested_total": 1,
+                "requests": [
+                    {
+                        "cache_key": "huldra:v1:missing",
+                        "raw_cache_status": "queued",
+                        "serving_status": "queued",
+                    }
+                ],
+            }
+        ),
+        _fake_json_response(
+            {
+                "status": "cache_miss",
+                "cache_key": "huldra:v1:missing",
+                "blocked_reason": "cache_miss",
+                "papers": [],
+            }
+        ),
+    ]
+
+    def fake_urlopen(request: object, **kwargs: object) -> _FakeBytesResponse:
+        return responses.pop(0)
+
+    with pytest.raises(HuldraMetadataError) as exc_info:
+        fetch_arxiv_papers(
+            category="cs.LG",
+            start=date(2023, 4, 1),
+            end=date(2023, 4, 30),
+            limit=80,
+            metadata_source="huldra",
+            urlopen=fake_urlopen,
+        )
+
+    message = str(exc_info.value)
+    assert "status=cache_miss" in message
+    assert "cache_key=huldra:v1:missing" in message
+    assert "blocked_reason=cache_miss" in message
+
+
+def test_arxiv_fetch_uses_arxiv_org_api_endpoint_by_default() -> None:
+    feed = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>http://arxiv.org/abs/2304.00185v1</id>
+        <updated>2023-04-01T00:41:51Z</updated>
+        <published>2023-04-01T00:41:51Z</published>
+        <title> Endpoint Test Paper </title>
+        <summary> Example. </summary>
+      </entry>
+    </feed>"""
+    requested_urls: list[str] = []
+
+    def fake_urlopen(request: object, **kwargs: object) -> _FakeBytesResponse:
+        requested_urls.append(request.full_url)  # type: ignore[attr-defined]
+        return _FakeBytesResponse(feed)
+
+    papers = fetch_arxiv_papers(
+        category="cs.LG",
+        start=date(2023, 4, 1),
+        end=date(2023, 4, 30),
+        limit=1,
+        urlopen=fake_urlopen,
+    )
+
+    assert ARXIV_API_URL == "https://arxiv.org/api/query"
+    assert requested_urls
+    assert requested_urls[0].startswith("https://arxiv.org/api/query?")
+    assert "submittedDate%3A%5B202304010000+TO+202304302359%5D" in requested_urls[0]
+    assert [paper.arxiv_id for paper in papers] == ["2304.00185"]
+
+
+def test_arxiv_fetch_pages_conservatively_when_page_size_is_smaller_than_limit() -> None:
+    first_page = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>http://arxiv.org/abs/2304.00001v1</id>
+        <updated>2023-04-01T00:00:00Z</updated>
+        <published>2023-04-01T00:00:00Z</published>
+        <title> First Page Paper </title>
+        <summary> Example. </summary>
+      </entry>
+    </feed>"""
+    second_page = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>http://arxiv.org/abs/2304.00002v1</id>
+        <updated>2023-04-02T00:00:00Z</updated>
+        <published>2023-04-02T00:00:00Z</published>
+        <title> Second Page Paper </title>
+        <summary> Example. </summary>
+      </entry>
+    </feed>"""
+    requested_urls: list[str] = []
+    responses = [_FakeBytesResponse(first_page), _FakeBytesResponse(second_page)]
+
+    def fake_urlopen(request: object, **kwargs: object) -> _FakeBytesResponse:
+        requested_urls.append(request.full_url)  # type: ignore[attr-defined]
+        return responses.pop(0)
+
+    papers = fetch_arxiv_papers(
+        category="cs.LG",
+        start=date(2023, 4, 1),
+        end=date(2023, 4, 30),
+        limit=2,
+        page_size=1,
+        urlopen=fake_urlopen,
+    )
+
+    assert len(requested_urls) == 2
+    assert "start=0" in requested_urls[0]
+    assert "max_results=1" in requested_urls[0]
+    assert "start=1" in requested_urls[1]
+    assert "max_results=1" in requested_urls[1]
+    assert [paper.arxiv_id for paper in papers] == ["2304.00001", "2304.00002"]
+
+
 def test_arxiv_fetch_retries_transient_server_error() -> None:
     feed = b"""<?xml version="1.0" encoding="UTF-8"?>
     <feed xmlns="http://www.w3.org/2005/Atom"
@@ -293,7 +599,7 @@ def test_arxiv_fetch_retries_transient_server_error() -> None:
             headers = Message()
             headers["Retry-After"] = "0.25"
             raise urllib.error.HTTPError(
-                url="https://export.arxiv.org/api/query",
+                url="https://arxiv.org/api/query",
                 code=503,
                 msg="service unavailable",
                 hdrs=headers,
@@ -326,7 +632,7 @@ def test_arxiv_fetch_stops_immediately_on_rate_limit() -> None:
         headers = Message()
         headers["Retry-After"] = "120"
         raise urllib.error.HTTPError(
-            url="https://export.arxiv.org/api/query",
+            url="https://arxiv.org/api/query",
             code=429,
             msg="rate limited",
             hdrs=headers,

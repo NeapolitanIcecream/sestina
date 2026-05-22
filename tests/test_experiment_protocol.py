@@ -13,9 +13,12 @@ def test_protocol_preserves_cached_result_publication_boundary() -> None:
 
     current = payload["current_result_boundary"]
     assert payload["paid_calls_made"] == 0
-    assert current["campaign_status"] == "stopped"
+    assert current["campaign_status"] == "autonomous_fresh_holdout_authorized"
     assert current["fresh_holdout_validation_claimed"] is False
     assert current["paid_label_purchase_authorized"] is False
+    assert current["autonomous_campaign_policy"][
+        "do_not_request_user_permission_for_missing_fresh_holdout_or_pointwise_artifacts"
+    ] is True
     assert "raw_paid_call_json" in current["cleanup_boundary"][
         "protect_artifact_classes"
     ]
@@ -97,7 +100,7 @@ def test_protocol_allows_only_dry_run_preflight_after_hard_gate_passes() -> None
     assert holdout["execution_stage"] == "dry_run_preflight_only"
     assert holdout["paid_label_purchase_authorized_by_this_protocol"] is False
     assert holdout["guardrails"]["jsonl_ledger_required"] is True
-    assert holdout["guardrails"]["zero_pointwise_unless_explicitly_approved"] is True
+    assert holdout["guardrails"]["pointwise_only_for_fresh_holdout_artifacts"] is True
 
 
 def test_protocol_blocks_unapproved_pointwise_calls_in_fresh_holdout() -> None:
@@ -110,9 +113,33 @@ def test_protocol_blocks_unapproved_pointwise_calls_in_fresh_holdout() -> None:
 
     holdout = payload["fresh_holdout_validation_protocol"]
     assert holdout["allowed_to_begin"] is False
-    assert "zero_pointwise_unless_explicitly_approved" in holdout[
+    assert "pointwise_only_for_fresh_holdout_artifacts" in holdout[
         "blocking_reasons"
     ]
+
+
+def test_protocol_allows_autonomous_fresh_holdout_pointwise_artifacts() -> None:
+    request = _fresh_holdout_request(
+        pointwise_calls_planned=8,
+        fresh_holdout_pointwise_artifacts_authorized=True,
+        standing_campaign_authorization=True,
+    )
+
+    payload = build_next_experiment_protocol(
+        no_paid_gate_artifact=_no_paid_gate_artifact(passed=True),
+        priority_direction="no_paid_replay_gate_randomized_coverage_floor",
+        fresh_holdout_request=request,
+    )
+
+    holdout = payload["fresh_holdout_validation_protocol"]
+    assert holdout["allowed_to_begin"] is True
+    assert (
+        holdout["execution_stage"]
+        == "autonomous_artifact_generation_then_pairwise_validation"
+    )
+    assert holdout["pointwise_policy"][
+        "fresh_holdout_pointwise_artifacts_authorized"
+    ] is True
 
 
 def test_protocol_rejects_unapproved_priority_direction() -> None:
@@ -165,6 +192,8 @@ def _fresh_holdout_request(
     *,
     pointwise_calls_planned: int = 0,
     explicit_pointwise_approval: bool = False,
+    fresh_holdout_pointwise_artifacts_authorized: bool = False,
+    standing_campaign_authorization: bool = False,
 ) -> dict:
     return {
         "requested": True,
@@ -176,5 +205,9 @@ def _fresh_holdout_request(
         "known_spend_before_validation_usd": 2.74603,
         "pointwise_calls_planned": pointwise_calls_planned,
         "explicit_pointwise_approval": explicit_pointwise_approval,
+        "fresh_holdout_pointwise_artifacts_authorized": (
+            fresh_holdout_pointwise_artifacts_authorized
+        ),
+        "standing_campaign_authorization": standing_campaign_authorization,
         "historical_paid_artifacts_immutable": True,
     }

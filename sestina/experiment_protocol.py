@@ -62,9 +62,15 @@ def build_next_experiment_protocol(
             "allowed_next_step": (
                 "cleanup_publication_review"
                 if not no_paid_gate["passed"]
-                else "review_fresh_holdout_dry_run_protocol"
+                else "autonomous_fresh_holdout_campaign"
             ),
             "paid_label_purchase_authorized_by_this_protocol": False,
+            "standing_campaign_authorization": (
+                "After PR #5, automation may select/freeze fresh holdout "
+                "buckets, generate reviewed pointwise artifacts for that fresh "
+                "holdout, and then run guarded pairwise-only validation while "
+                "the campaign cap remains enforceable."
+            ),
         },
         "priority_experiment_direction": _priority_direction(priority_direction),
         "hard_gate_standards": _hard_gate_standards(),
@@ -111,8 +117,11 @@ def validate_next_experiment_protocol(payload: Mapping[str, Any]) -> None:
         raise ValueError("next experiment protocol must make zero pointwise calls")
 
     current = _mapping(payload.get("current_result_boundary"))
-    if current.get("campaign_status") != "stopped":
-        raise ValueError("current campaign status must remain stopped")
+    if current.get("campaign_status") not in {
+        "stopped",
+        "autonomous_fresh_holdout_authorized",
+    }:
+        raise ValueError("current campaign status is not approved")
     if current.get("fresh_holdout_validation_claimed") is not False:
         raise ValueError("current cached result cannot be marked fresh validation")
     if current.get("paid_label_purchase_authorized") is not False:
@@ -147,13 +156,16 @@ def validate_next_experiment_protocol(payload: Mapping[str, Any]) -> None:
             raise ValueError("fresh holdout cannot begin before no-paid gate passes")
         if fresh.get("guardrails_clear") is not True:
             raise ValueError("fresh holdout cannot begin with guardrail blockers")
-        if fresh.get("execution_stage") != "dry_run_preflight_only":
-            raise ValueError("fresh holdout starts with dry-run preflight only")
+        if fresh.get("execution_stage") not in {
+            "dry_run_preflight_only",
+            "autonomous_artifact_generation_then_pairwise_validation",
+        }:
+            raise ValueError("fresh holdout execution stage is not approved")
 
 
 def _current_result_boundary() -> dict[str, Any]:
     return {
-        "campaign_status": "stopped",
+        "campaign_status": "autonomous_fresh_holdout_authorized",
         "current_best_result": CURRENT_BEST_RESULT_NAME,
         "random_control": CURRENT_RANDOM_CONTROL_NAME,
         "claim_scope": (
@@ -163,6 +175,13 @@ def _current_result_boundary() -> dict[str, Any]:
         "fresh_holdout_validation_claimed": False,
         "publication_ready_as_is": False,
         "paid_label_purchase_authorized": False,
+        "autonomous_campaign_policy": {
+            "fresh_holdout_selection_delegated_to_automation": True,
+            "fresh_holdout_pointwise_artifact_generation_authorized": True,
+            "guarded_pairwise_validation_authorized_after_preflight_go": True,
+            "do_not_request_user_permission_for_missing_fresh_holdout_or_pointwise_artifacts": True,
+            "stop_if_cap_or_usage_measurement_not_enforceable": True,
+        },
         "cleanup_boundary": {
             "public_claim_must_say_cached_no_paid_not_fresh_validation": True,
             "protect_artifact_classes": list(PROTECTED_PUBLICATION_ARTIFACT_CLASSES),
@@ -309,12 +328,21 @@ def _fresh_holdout_protocol(
 ) -> dict[str, Any]:
     requested = bool(request.get("requested", False))
     pointwise_calls = int(request.get("pointwise_calls_planned", 0) or 0)
-    pointwise_approved = bool(request.get("explicit_pointwise_approval", False))
+    pointwise_authorized = bool(
+        request.get("fresh_holdout_pointwise_artifacts_authorized", False)
+        or request.get("explicit_pointwise_approval", False)
+    )
     ledger_path = str(request.get("ledger_path") or "")
     max_usd = float(request.get("max_usd", 0.0) or 0.0)
+    autonomous_campaign = bool(
+        request.get("standing_campaign_authorization", False)
+        or request.get("autonomous_campaign_authorized", False)
+    )
     guardrails = {
         "no_paid_gate_passed": no_paid_gate.get("passed") is True,
-        "dry_run_required": request.get("dry_run") is True,
+        "dry_run_or_autonomous_campaign_required": (
+            request.get("dry_run") is True or autonomous_campaign
+        ),
         "provider_availability_check_required": request.get(
             "provider_availability_check"
         )
@@ -331,8 +359,8 @@ def _fresh_holdout_protocol(
             or 0.0
         )
         == CURRENT_KNOWN_SPEND_USD,
-        "zero_pointwise_unless_explicitly_approved": (
-            pointwise_calls == 0 or pointwise_approved
+        "pointwise_only_for_fresh_holdout_artifacts": (
+            pointwise_calls == 0 or pointwise_authorized
         ),
         "historical_paid_artifacts_immutable": request.get(
             "historical_paid_artifacts_immutable"
@@ -344,14 +372,20 @@ def _fresh_holdout_protocol(
     return {
         "requested": requested,
         "allowed_to_begin": allowed,
-        "execution_stage": "dry_run_preflight_only",
+        "execution_stage": (
+            "autonomous_artifact_generation_then_pairwise_validation"
+            if autonomous_campaign
+            else "dry_run_preflight_only"
+        ),
         "guardrails_clear": not blockers,
         "blocking_reasons": blockers,
         "guardrails": guardrails,
         "provider_availability_check": {
             "required_before_any_paid_label_generation": True,
             "allowed_call": "GET /models",
-            "label_generation_calls_allowed_in_preflight": 0,
+            "label_generation_calls_allowed_in_preflight": (
+                pointwise_calls if autonomous_campaign and pointwise_authorized else 0
+            ),
         },
         "ledger": {
             "path": ledger_path or None,
@@ -366,15 +400,19 @@ def _fresh_holdout_protocol(
         },
         "pointwise_policy": {
             "pointwise_calls_planned": pointwise_calls,
-            "explicit_pointwise_approval": pointwise_approved,
-            "zero_pointwise_unless_explicitly_approved": True,
+            "fresh_holdout_pointwise_artifacts_authorized": pointwise_authorized,
+            "standing_campaign_authorization": autonomous_campaign,
+            "scope": "fresh_holdout_artifact_generation_and_review_only",
+            "pointwise_for_pairwise_validation_forbidden": True,
         },
         "paid_label_purchase_authorized_by_this_protocol": False,
         "stop_rule": (
             "Stop before any label-generation call if the no-paid gate fails, "
             "dry-run estimate is missing, provider availability is unavailable, "
             "the JSONL ledger is unavailable, the hard max-usd cap would be "
-            "exceeded, or an unapproved pointwise call is planned."
+            "exceeded, usage/cost cannot be measured well enough to enforce "
+            "the cap, leakage is detected, or a pointwise call is planned "
+            "outside fresh-holdout artifact generation/review."
         ),
     }
 

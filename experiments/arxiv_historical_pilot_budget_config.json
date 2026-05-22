@@ -3,7 +3,7 @@
   "currency": "USD",
   "rate_assumption_note": "Pilot-specific estimate for eight historical arXiv buckets with up to 80 papers each and K=5. Rate values are planning estimates and are guarded by the paid-run ledger cap.",
   "model_name_policy": {
-    "require_provider_prefix": true,
+    "require_provider_prefix": false,
     "availability_check_required_before_paid_run": true
   },
   "pairwise_budget_ablation": {
@@ -19,7 +19,7 @@
     "metrics_artifact": "pairwise_budget_ablation_metrics.csv"
   },
   "rate_card": {
-    "openai/gpt-5.4-mini": {
+    "gpt-5.4-mini": {
       "input_usd_per_1m_tokens": 0.25,
       "output_usd_per_1m_tokens": 2.0,
       "discount_multiplier": 1.0,
@@ -44,9 +44,9 @@
     {
       "name": "pilot",
       "allocation_fraction": 1.0,
-      "pointwise_model": "openai/gpt-5.4-mini",
-      "pairwise_model": "openai/gpt-5.4-mini",
-      "audit_model": "openai/gpt-5.4-mini",
+      "pointwise_model": "gpt-5.4-mini",
+      "pairwise_model": "gpt-5.4-mini",
+      "audit_model": "gpt-5.4-mini",
       "strategies": [
         "random",
         "semantic_baseline",
